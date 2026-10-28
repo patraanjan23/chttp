@@ -116,9 +116,10 @@ single-threaded process per connection, capped by `--max-connections`.
   `Connection: keep-alive`. `Connection: close` ends persistence. A client that
   stalls while a request is incomplete gets `408`; an idle persistent
   connection is closed after the same timeout.
-- Request bodies are unsupported: nonzero `Content-Length`, duplicate length
-  fields, and any `Transfer-Encoding` are rejected with `400` and the
-  connection closes. Pipelined request bytes are buffered and preserved.
+- Bounded `POST /` bodies are echoed (maximum 8 KiB), using either
+  `Content-Length` or chunked transfer encoding. Conflicting framing, malformed
+  chunks, and oversized bodies are rejected; pipelined bytes remain buffered
+  for the next request.
 - Routes:
 
   | Request          | Response                          |
@@ -126,6 +127,7 @@ single-threaded process per connection, capped by `--max-connections`.
   | `GET /`          | 200, a small HTML page            |
   | `GET /health`    | 200, `ok` (query string ignored)  |
   | `HEAD` on either | same headers, no body             |
+  | `POST /`         | 200, echoes the bounded body      |
   | other path       | 404                               |
   | other method     | 405 with `Allow: GET, HEAD`       |
   | malformed        | 400 / 414 / 431 / 505 as appropriate |
@@ -227,8 +229,8 @@ An HTTP server is a byte pipeline with one required loop:
 4. **Block in `accept`** - each call returns a new connected socket.
 5. **Read the request** - HTTP is text until `\r\n\r\n` (end of headers). The
    first line is `METHOD SP TARGET SP VERSION`, so a bounded parse of that line
-   is enough for routing. Bodies are not supported; non-empty bodies are
-   rejected so their bytes cannot be confused with a later request.
+   is enough for routing. Bounded `POST /` bodies are read according to
+   `Content-Length` or chunked framing before a pipelined request is parsed.
 6. **Write the response** - status line, headers, blank line, body. The client
    finds the body end via `Content-Length`; a persistent connection may then
    carry another bounded request.
@@ -288,8 +290,9 @@ the OS default for `IPV6_V6ONLY` is left alone.
 - At the cap, new plaintext connections get `503` + `Retry-After: 1`, then
   close. TLS connections are closed without a response. The parent reaps
   first, so a just-finished request frees its slot immediately.
-- Memory per request is bounded by the 8 KiB request buffer plus the Fil-C
-  runtime; during a TLS handshake the child also holds about 66 KiB of record,
+- Worker stack buffers are bounded: 8 KiB request head, 8 KiB pipelined input,
+  and an 8 KiB request body, plus the Fil-C runtime. During a TLS handshake the
+  child also holds about 66 KiB of record,
   handshake, and output buffers, which are freed when it exits. Total worker
   memory is bounded by `--max-connections`. On the test aarch64 build a held
   worker measured about 2.4 MB RSS including shared pages, so lower the cap on
@@ -478,20 +481,19 @@ curl -i -X POST http://127.0.0.1:8080/
 
 `make check` builds the server and runs three suites: `tests/crypto_test.c`
 checks the primitives against RFC/NIST vectors; `tests/smoke.sh` covers the
-HTTP surface, `HEAD`, malformed requests, 414/431 limits, timeout enforcement,
-16-way concurrency, 503 backpressure, graceful drain, and configuration;
+HTTP surface, `HEAD`, malformed requests, bounded POST/chunked bodies,
+414/431 limits, timeout enforcement, 16-way concurrency, 503 backpressure,
+graceful drain, and configuration;
 `tests/tls.sh` generates Ed25519 credentials with `openssl` and covers
 interoperability (`curl`, `s_client`, the PQ-hybrid HelloRetryRequest), HSTS,
 TLS 1.2 rejection, DER and chained credentials, startup validation, handshake
 deadlines, and the TLS connection cap. The smoke suite also covers pipelining,
-HTTP/1.0 persistence, request-body rejection, and the 100-request connection cap.
+HTTP/1.0 persistence, body/framing validation, and the 100-request connection cap.
 
 For additional HTTP parser coverage, the external [h1spec](https://github.com/uNetworking/h1spec)
-smoke suite was run against plaintext HTTP. It reported 31/33 checks passing;
-the two expected failures are POST request-body tests, because this server
-intentionally rejects request bodies and chunked transfer encoding. h1spec is
-not vendored and is not part of `make check`; clone its repository, start the
-server, then run this from the h1spec checkout with Deno:
+smoke suite was run against plaintext HTTP and all 33 checks passed. h1spec
+is not vendored and is not part of `make check`; clone its repository, start
+the server, then run this from the h1spec checkout with Deno:
 
 ```sh
 deno run --allow-net http_test.ts 127.0.0.1 8080
@@ -584,9 +586,9 @@ not substitutes.
   capped by `--max-connections` (64 by default); there is no thread pool or
   event loop.
 - Production-ready within this deliberately small feature set, not a general
-  web server: no chunked transfer, request bodies, compression,
-  virtual hosts, range requests, or dynamic content. It serves two built-in
-  routes.
+  web server: no request-body support beyond the bounded `POST /` echo,
+  compression, virtual hosts, range requests, or dynamic content. It serves
+  two built-in routes and the echo endpoint.
 - TLS is a narrow, opt-in profile: TLS 1.3, X25519, Ed25519 certificates,
   AES-128-GCM only. Clients that cannot offer that exact combination cannot
   connect. There is no certificate hot-reload (restart to rotate), no SNI

@@ -280,8 +280,19 @@ ok "HTTPS 404"
 
 code=$(curl -sS --max-time 10 --cacert "$CA" -o /dev/null -w '%{http_code}' \
     -X POST "https://127.0.0.1:$SERVER_PORT/")
-[ "$code" = 405 ] || fail "HTTPS POST returned $code"
-ok "HTTPS 405"
+[ "$code" = 405 ] || fail "empty HTTPS POST returned $code"
+ok "empty HTTPS POST is rejected"
+
+body=$(curl -fsS --max-time 10 --cacert "$CA" --data-binary 'hello' \
+    "https://127.0.0.1:$SERVER_PORT/")
+[ "$body" = "hello" ] || fail "HTTPS Content-Length POST echo returned '$body'"
+ok "HTTPS Content-Length POST body is echoed"
+
+body=$(curl -fsS --max-time 10 --cacert "$CA" \
+    -H 'Transfer-Encoding: chunked' --data-binary 'hello' \
+    "https://127.0.0.1:$SERVER_PORT/")
+[ "$body" = "hello" ] || fail "HTTPS chunked POST echo returned '$body'"
+ok "HTTPS chunked POST body is echoed"
 
 curl -sS --max-time 10 --cacert "$CA" -I \
     "https://127.0.0.1:$SERVER_PORT/" >"$WORK/head.txt" 2>&1 \

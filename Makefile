@@ -46,7 +46,7 @@ $(DYNBIN): $(SRC) $(HEADERS) | build
 analyze:
 	$(CC) --analyze $(CFLAGS) -Xanalyzer -analyzer-output=text $(SRC)
 
-# Valgrind on the dynamic build: start, fetch two pages, stop, check report.
+# Valgrind on the dynamic build: fetch pages and exercise both body framings.
 # Children are silent after fork; the parent's report is the one we inspect.
 valgrind: $(DYNBIN)
 	@set -e; \
@@ -63,13 +63,16 @@ valgrind: $(DYNBIN)
 		sleep 0.2; \
 	done; \
 	curl -fsS "http://127.0.0.1:$$port/" | grep -q "hello from Fil-C"; \
+	curl -fsS --data-binary hello "http://127.0.0.1:$$port/" | grep -qx hello; \
+	curl -fsS -H 'Transfer-Encoding: chunked' --data-binary hello \
+		"http://127.0.0.1:$$port/" | grep -qx hello; \
 	kill -TERM $$vpid; \
 	wait $$vpid; \
 	grep -q "ERROR SUMMARY: 0 errors" build/valgrind.log; \
 	echo "ok: valgrind found no errors (build/valgrind.log)"
 
-# The same, over TLS. Slow on purpose: a handshake under Valgrind is
-# thousands of interpreted big-integer operations.
+# The same request/body coverage over TLS. Slow on purpose: a handshake under
+# Valgrind is thousands of interpreted big-integer operations.
 valgrind-tls: $(DYNBIN)
 	@set -e; \
 	dir=$$(mktemp -d); \
@@ -93,6 +96,11 @@ valgrind-tls: $(DYNBIN)
 	done; \
 	curl -fsS --max-time 20 --cacert $$dir/cert.pem \
 		"https://127.0.0.1:$$port/" | grep -q "hello from Fil-C"; \
+	curl -fsS --max-time 20 --cacert $$dir/cert.pem --data-binary hello \
+		"https://127.0.0.1:$$port/" | grep -qx hello; \
+	curl -fsS --max-time 20 --cacert $$dir/cert.pem \
+		-H 'Transfer-Encoding: chunked' --data-binary hello \
+		"https://127.0.0.1:$$port/" | grep -qx hello; \
 	kill -TERM $$vpid; \
 	wait $$vpid; \
 	grep -q "ERROR SUMMARY: 0 errors" build/valgrind-tls.log; \

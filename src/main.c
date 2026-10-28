@@ -5,8 +5,8 @@
  * a bounded number of requests. Concurrency is bounded, every wait has a
  * deadline, and shutdown drains in-flight requests before exiting.
  *
- * Serves GET and HEAD only, over plaintext or TLS 1.3. No chunked transfer
- * encoding or config files; configuration is flags plus environment
+ * Serves GET, HEAD, and bounded POST echoes over plaintext or TLS 1.3. No
+ * configuration files; configuration is flags plus environment
  * variables.
  */
 
@@ -42,6 +42,7 @@
 #define MAX_TIMEOUT_SECS     300
 
 #define REQUEST_MAX 8192 /* whole request head, including CRLF CRLF */
+#define BODY_MAX    8192
 #define URI_MAX     1024 /* request-target, including '/' */
 #define KEEPALIVE_MAX_REQUESTS 100
 
@@ -82,6 +83,12 @@ struct request_info {
     const char *target;
     const char *version;
     int include_body;
+};
+
+struct request_framing {
+    size_t content_length;
+    int has_content_length;
+    int chunked;
 };
 
 struct server {
@@ -552,6 +559,10 @@ static const struct response RESP_408 = {
     408, "Request Timeout", "text/plain; charset=utf-8",
     "request timeout\n", sizeof "request timeout\n" - 1, 0
 };
+static const struct response RESP_413 = {
+    413, "Content Too Large", "text/plain; charset=utf-8",
+    "content too large\n", sizeof "content too large\n" - 1, 0
+};
 static const struct response RESP_414 = {
     414, "URI Too Long", "text/plain; charset=utf-8",
     "uri too long\n", sizeof "uri too long\n" - 1, 0
@@ -791,7 +802,8 @@ static void route_request(char *request, struct request_info *info,
         *response = strncmp(version, "HTTP/", 5) == 0 ? RESP_505 : RESP_400;
         return;
     }
-    if (strcmp(method, "GET") != 0 && strcmp(method, "HEAD") != 0) {
+    if (strcmp(method, "GET") != 0 && strcmp(method, "HEAD") != 0
+        && strcmp(method, "POST") != 0) {
         *response = RESP_405;
         return;
     }
@@ -804,7 +816,9 @@ static void route_request(char *request, struct request_info *info,
         return;
     }
 
-    if (path_is(target, "/"))
+    if (strcmp(method, "POST") == 0)
+        *response = path_is(target, "/") ? RESP_405 : RESP_404;
+    else if (path_is(target, "/"))
         *response = RESP_INDEX;
     else if (path_is(target, "/health"))
         *response = RESP_HEALTH;
@@ -892,15 +906,17 @@ static void finish_response(struct connection *conn, const char *peer,
                response->status, bytes, ms_since(start));
 }
 
-/* Return persistence policy and reject bodies: the server has no request-body
- * API, so accepting one would make its bytes ambiguous with the next request. */
-static int request_keep_alive(char *request, int *keep_alive)
+/* Parse connection policy and bounded request framing. The worker consumes
+ * every accepted body before parsing the next pipelined request. */
+static int request_keep_alive(char *request, int *keep_alive,
+                              struct request_framing *framing)
 {
     char *line = strstr(request, "\r\n");
     int close_seen = 0, keep_seen = 0, content_length_seen = 0;
-    int host_seen = 0;
+    int host_seen = 0, transfer_encoding_seen = 0;
     int is_http11;
 
+    memset(framing, 0, sizeof *framing);
     if (line == NULL)
         return -1;
     {
@@ -927,6 +943,12 @@ static int request_keep_alive(char *request, int *keep_alive)
         if (!is_token(line))
             return -1;
         while (*colon == ' ' || *colon == '\t') colon++;
+        {
+            char *value_end = colon + strlen(colon);
+            while (value_end > colon
+                   && (value_end[-1] == ' ' || value_end[-1] == '\t'))
+                *--value_end = '\0';
+        }
         for (const unsigned char *value = (const unsigned char *)colon;
              *value != '\0'; value++) {
             if ((*value < 0x20 && *value != '\t') || *value == 0x7f)
@@ -953,17 +975,174 @@ static int request_keep_alive(char *request, int *keep_alive)
                 token = strtok_r(NULL, ",", &save);
             } while (token != NULL);
         } else if (strcasecmp(line, "Content-Length") == 0) {
-            if (content_length_seen++ || strcmp(colon, "0") != 0)
+            char *tail;
+            unsigned long long length;
+            if (content_length_seen++ || *colon == '\0')
                 return -1;
+            for (const unsigned char *digit = (const unsigned char *)colon;
+                 *digit != '\0'; digit++)
+                if (*digit < '0' || *digit > '9')
+                    return -1;
+            errno = 0;
+            length = strtoull(colon, &tail, 10);
+            if (errno != 0 || *tail != '\0')
+                return -1;
+            framing->content_length = length > BODY_MAX
+                                    ? BODY_MAX + 1 : (size_t)length;
+            framing->has_content_length = 1;
         } else if (strcasecmp(line, "Transfer-Encoding") == 0) {
-            return -1;
+            if (transfer_encoding_seen++ || strcasecmp(colon, "chunked") != 0)
+                return -1;
+            framing->chunked = 1;
         }
         line = end + 2;
     }
     if (is_http11 && host_seen != 1)
         return -1;
+    if (framing->chunked && (framing->has_content_length || !is_http11))
+        return -1;
     *keep_alive = !close_seen && (is_http11 || keep_seen);
     return 0;
+}
+
+static enum read_result read_exact(struct connection *conn, void *output,
+                                   size_t length, char *carry,
+                                   size_t *pending)
+{
+    unsigned char *out = output;
+    size_t used = 0;
+
+    if (*pending != 0) {
+        used = *pending < length ? *pending : length;
+        memcpy(out, carry, used);
+        *pending -= used;
+        if (*pending != 0)
+            memmove(carry, carry + used, *pending);
+    }
+    while (used < length) {
+        ssize_t received;
+        if (ms_since(conn->start) >= conn->timeout_ms)
+            return READ_TIMEOUT;
+        received = connection_read(conn, out + used, length - used);
+        if (received < 0) {
+            if (conn->tls != NULL)
+                return tls_error_is_timeout(conn->tls) ? READ_TIMEOUT
+                                                       : READ_ABORT;
+            if (errno == EINTR) {
+                if (stop_requested)
+                    return READ_ABORT;
+                continue;
+            }
+            return (errno == EAGAIN || errno == EWOULDBLOCK)
+                 ? READ_TIMEOUT : READ_ABORT;
+        }
+        if (received == 0)
+            return READ_BAD;
+        used += (size_t)received;
+    }
+    return READ_OK;
+}
+
+static enum read_result read_crlf_line(struct connection *conn, char *line,
+                                       size_t capacity, char *carry,
+                                       size_t *pending)
+{
+    size_t used = 0;
+    while (used + 1 < capacity) {
+        enum read_result result = read_exact(conn, line + used, 1, carry,
+                                             pending);
+        if (result != READ_OK)
+            return result;
+        if (used != 0 && line[used - 1] == '\r' && line[used] == '\n') {
+            line[used - 1] = '\0';
+            return READ_OK;
+        }
+        used++;
+    }
+    return READ_TOO_LARGE;
+}
+
+static enum read_result read_chunked_body(struct connection *conn,
+                                          unsigned char *body,
+                                          size_t *body_length, char *carry,
+                                          size_t *pending)
+{
+    size_t total = 0, trailer_bytes = 0;
+    for (int chunks = 0; chunks < 512; chunks++) {
+        char line[128], *end;
+        unsigned long long chunk_size;
+        enum read_result result = read_crlf_line(conn, line, sizeof line,
+                                                  carry, pending);
+        if (result != READ_OK)
+            return result;
+        {
+            char *semi = strchr(line, ';');
+            char *digits_end = semi != NULL ? semi : line + strlen(line);
+            if (digits_end == line)
+                return READ_BAD;
+            for (char *digit = line; digit < digits_end; digit++)
+                if (!((*digit >= '0' && *digit <= '9')
+                      || (*digit >= 'a' && *digit <= 'f')
+                      || (*digit >= 'A' && *digit <= 'F')))
+                    return READ_BAD;
+            if (semi != NULL)
+                for (const unsigned char *ext =
+                         (const unsigned char *)semi + 1; *ext != '\0'; ext++)
+                    if (*ext < 0x20 || *ext > 0x7e)
+                        return READ_BAD;
+            errno = 0;
+            chunk_size = strtoull(line, &end, 16);
+            if (errno != 0 || end != digits_end)
+                return READ_BAD;
+        }
+        if (chunk_size == 0) {
+            for (;;) {
+                result = read_crlf_line(conn, line, sizeof line, carry,
+                                        pending);
+                if (result != READ_OK)
+                    return result;
+                trailer_bytes += strlen(line) + 2;
+                if (trailer_bytes > REQUEST_MAX)
+                    return READ_TOO_LARGE;
+                if (line[0] == '\0') {
+                    *body_length = total;
+                    return READ_OK;
+                }
+                {
+                    char *colon = strchr(line, ':');
+                    if (colon == NULL || colon == line)
+                        return READ_BAD;
+                    *colon++ = '\0';
+                    if (!is_token(line)
+                        || strcasecmp(line, "Content-Length") == 0
+                        || strcasecmp(line, "Transfer-Encoding") == 0
+                        || strcasecmp(line, "Host") == 0
+                        || strcasecmp(line, "Connection") == 0)
+                        return READ_BAD;
+                    for (const unsigned char *value =
+                             (const unsigned char *)colon; *value != '\0'; value++)
+                        if ((*value < 0x20 && *value != '\t') || *value == 0x7f)
+                            return READ_BAD;
+                }
+            }
+        }
+        if (chunk_size > BODY_MAX - total)
+            return READ_TOO_LARGE;
+        result = read_exact(conn, body + total, (size_t)chunk_size, carry,
+                            pending);
+        if (result != READ_OK)
+            return result;
+        total += (size_t)chunk_size;
+        {
+            char ending[2];
+            result = read_exact(conn, ending, sizeof ending, carry, pending);
+            if (result != READ_OK)
+                return result;
+            if (ending[0] != '\r' || ending[1] != '\n')
+                return READ_BAD;
+        }
+    }
+    return READ_TOO_LARGE;
 }
 
 static void handle_client(int fd, const char *peer, const struct config *cfg,
@@ -1005,6 +1184,9 @@ static void handle_client(int fd, const char *peer, const struct config *cfg,
 
     for (int count = 0; count < KEEPALIVE_MAX_REQUESTS; count++) {
         int keep_alive = 0;
+        struct request_framing framing;
+        unsigned char body[BODY_MAX];
+        size_t body_length = 0;
         info = (struct request_info){ "-", "-", "-", 1 };
         clock_gettime(CLOCK_MONOTONIC, &start);
         result = read_headers(&conn, request, REQUEST_MAX, &used, carry,
@@ -1031,12 +1213,48 @@ static void handle_client(int fd, const char *peer, const struct config *cfg,
             break;
         }
         request[used] = '\0';
-        if (request_keep_alive(request, &keep_alive) < 0) {
+        if (request_keep_alive(request, &keep_alive, &framing) < 0) {
             finish_response(&conn, peer, &RESP_400, 1, &info, &start,
                             secure, 0);
             goto out;
         }
         route_request(request, &info, &response);
+        if (framing.content_length > BODY_MAX) {
+            finish_response(&conn, peer, &RESP_413, 1, &info, &start,
+                            secure, 0);
+            goto out;
+        }
+        if (framing.chunked || framing.content_length != 0) {
+            enum read_result body_result;
+            if (strcmp(info.method, "POST") != 0) {
+                finish_response(&conn, peer, &RESP_400, 1, &info, &start,
+                                secure, 0);
+                goto out;
+            }
+            if (framing.chunked)
+                body_result = read_chunked_body(&conn, body, &body_length,
+                                                carry, &pending);
+            else {
+                body_length = framing.content_length;
+                body_result = read_exact(&conn, body, body_length, carry,
+                                         &pending);
+            }
+            if (body_result != READ_OK) {
+                const struct response *error = body_result == READ_TIMEOUT
+                                             ? &RESP_408
+                                             : body_result == READ_TOO_LARGE
+                                               ? &RESP_413 : &RESP_400;
+                finish_response(&conn, peer, error, 1, &info, &start,
+                                secure, 0);
+                goto out;
+            }
+            if (strcmp(info.target, "/") == 0) {
+                response = (struct response){
+                    200, "OK", "text/plain; charset=utf-8",
+                    (const char *)body, body_length, 0
+                };
+            }
+        }
         if (response.status == 400 || response.status == 408
             || response.status == 414 || response.status == 431
             || response.status == 505)

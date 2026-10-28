@@ -214,8 +214,33 @@ grep -q '^Connection: close' <<<"${response##*HTTP/1.1}" \
     || fail "100th response did not advertise close"
 ok "connection is closed after the bounded 100-request limit"
 
-response=$(raw 'POST / HTTP/1.1\r\nHost: test\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx')
-expect_code "$response" 400 "request bodies are rejected safely"
+response=$(raw 'POST / HTTP/1.1\r\nHost: test\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello')
+expect_code "$response" 200 "bounded POST echo is 200"
+case "$response" in
+    *$'\r\n\r\nhello'*) ok "Content-Length POST body is echoed" ;;
+    *) fail "Content-Length POST body was not echoed" ;;
+esac
+
+response=$(raw 'POST / HTTP/1.1\r\nHost: test\r\nContent-Length: 5\r\n\r\nhelloGET /health HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\nX')
+[ "$(grep -o 'HTTP/1.1 200' <<<"$response" | wc -l)" -eq 2 ] \
+    || fail "request following a POST body was lost"
+case "$response" in
+    *$'helloHTTP/1.1 200 OK'*) ok "pipelining remains aligned after POST body" ;;
+    *) fail "response after POST body was not preserved" ;;
+esac
+
+response=$(raw 'POST / HTTP/1.1\r\nHost: test\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\nc\r\nHellO world1\r\n0\r\n\r\n')
+expect_code "$response" 200 "chunked POST echo is 200"
+case "$response" in
+    *$'\r\n\r\nHellO world1'*) ok "chunked POST body is decoded and echoed" ;;
+    *) fail "chunked POST body was not echoed" ;;
+esac
+
+response=$(raw 'POST / HTTP/1.1\r\nHost: test\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\nz\r\nignored\r\n0\r\n\r\n')
+expect_code "$response" 400 "malformed chunk size is rejected"
+
+response=$(raw 'POST / HTTP/1.1\r\nHost: test\r\nContent-Length: 8193\r\nConnection: close\r\n\r\n')
+expect_code "$response" 413 "oversized request body is rejected"
 
 body=$(curl -fsS "http://127.0.0.1:$SERVER_PORT/health?probe=1")
 [ "$body" = "ok" ] || fail "GET /health?probe=1 returned '$body'"
