@@ -251,6 +251,15 @@ expect_code "$response" 400 "malformed request line is 400"
 response=$(raw 'GET / HTTP/9.9\r\nHost: test\r\nConnection: close\r\n\r\n')
 expect_code "$response" 505 "unsupported HTTP version is 505"
 
+response=$(raw 'GET / HTTP/1.1\r\nConnection: close\r\n\r\n')
+expect_code "$response" 400 "HTTP/1.1 requires Host"
+
+response=$(raw 'GET / HTTP/1.1\r\nHost: one\r\nHost: two\r\nConnection: close\r\n\r\n')
+expect_code "$response" 400 "duplicate Host headers are rejected"
+
+response=$(raw $'GET / HTTP/1.1\r\nHost: test\r\nX-Bad: value\a\r\nConnection: close\r\n\r\n')
+expect_code "$response" 400 "control characters in header values are rejected"
+
 echo "== limits =="
 long_path="/$(head -c 2000 /dev/zero | tr '\0' 'a')"
 response=$(raw "GET $long_path HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")

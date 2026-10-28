@@ -898,6 +898,7 @@ static int request_keep_alive(char *request, int *keep_alive)
 {
     char *line = strstr(request, "\r\n");
     int close_seen = 0, keep_seen = 0, content_length_seen = 0;
+    int host_seen = 0;
     int is_http11;
 
     if (line == NULL)
@@ -926,7 +927,15 @@ static int request_keep_alive(char *request, int *keep_alive)
         if (!is_token(line))
             return -1;
         while (*colon == ' ' || *colon == '\t') colon++;
-        if (strcasecmp(line, "Connection") == 0) {
+        for (const unsigned char *value = (const unsigned char *)colon;
+             *value != '\0'; value++) {
+            if ((*value < 0x20 && *value != '\t') || *value == 0x7f)
+                return -1;
+        }
+        if (strcasecmp(line, "Host") == 0) {
+            if (host_seen++ || *colon == '\0')
+                return -1;
+        } else if (strcasecmp(line, "Connection") == 0) {
             char *save = NULL;
             char *token = strtok_r(colon, ",", &save);
             if (token == NULL)
@@ -951,6 +960,8 @@ static int request_keep_alive(char *request, int *keep_alive)
         }
         line = end + 2;
     }
+    if (is_http11 && host_seen != 1)
+        return -1;
     *keep_alive = !close_seen && (is_http11 || keep_seen);
     return 0;
 }

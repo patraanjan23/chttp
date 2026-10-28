@@ -483,7 +483,19 @@ HTTP surface, `HEAD`, malformed requests, 414/431 limits, timeout enforcement,
 `tests/tls.sh` generates Ed25519 credentials with `openssl` and covers
 interoperability (`curl`, `s_client`, the PQ-hybrid HelloRetryRequest), HSTS,
 TLS 1.2 rejection, DER and chained credentials, startup validation, handshake
-deadlines, and the TLS connection cap.
+deadlines, and the TLS connection cap. The smoke suite also covers pipelining,
+HTTP/1.0 persistence, request-body rejection, and the 100-request connection cap.
+
+For additional HTTP parser coverage, the external [h1spec](https://github.com/uNetworking/h1spec)
+smoke suite was run against plaintext HTTP. It reported 31/33 checks passing;
+the two expected failures are POST request-body tests, because this server
+intentionally rejects request bodies and chunked transfer encoding. h1spec is
+not vendored and is not part of `make check`; clone its repository, start the
+server, then run this from the h1spec checkout with Deno:
+
+```sh
+deno run --allow-net http_test.ts 127.0.0.1 8080
+```
 
 ## Tooling
 
