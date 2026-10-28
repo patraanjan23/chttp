@@ -1,0 +1,39 @@
+[Unit]
+Description=chttp minimal HTTP server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/chttp --bind 127.0.0.1 --port 8080
+Environment=CHTTP_MAX_CONNECTIONS=64 CHTTP_TIMEOUT=5
+# TLS is opt-in. Keep the key readable only by root, comment out the plain
+# ExecStart above, and use systemd's credential staging:
+#   LoadCredential=tls-cert:/etc/chttp/cert.pem
+#   LoadCredential=tls-key:/etc/chttp/key.pem
+#   ExecStart=/usr/local/bin/chttp --bind 127.0.0.1 --port 8443 \
+#       --tls-cert %d/tls-cert --tls-key %d/tls-key
+Restart=on-failure
+RestartSec=1
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+# Hardening that does not interfere with the Fil-C runtime or its GC.
+# Ports below 1024 additionally need CAP_NET_BIND_SERVICE (or run as root).
+DynamicUser=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+
+[Install]
+WantedBy=multi-user.target
