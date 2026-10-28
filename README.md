@@ -30,11 +30,11 @@ where it grows narrow and obvious.**
 Three properties follow from that, and they are constraints on changes, not
 aspirations:
 
-**Minimal.** Three C files, one build file, one request per connection, and a
-bounded number of short-lived single-threaded worker processes. The protocol
-surface is exactly what the routes need: an 8 KiB bounded header read, a
-first-line parse, a status line, a fixed set of response headers, a body. There
-is no config language, no plugin loader, no template engine, no logging
+**Minimal.** Three C files, one build file, up to 100 requests per connection,
+and a bounded number of short-lived single-threaded worker processes. The
+protocol surface is exactly what the routes need: an 8 KiB bounded header
+read, a first-line parse, a status line, a fixed set of response headers, a
+body. There is no config language, no plugin loader, no template engine, no logging
 framework, no event loop, no HTTP library, and no crypto library. Anything that
 can be deleted is deleted, because code that does not exist cannot be
 exploited, patched, or misconfigured. TLS is opt-in rather than the default:
@@ -91,11 +91,11 @@ the trusted core. TLS was added under that rule: it is code in the tree, behind
 the transport seam, with no new library.
 
 Non-goals, deliberately: TLS 1.2 and below, session resumption, 0-RTT,
-renegotiation, client certificates, ALPN/HTTP/2, keep-alive, unbounded
-concurrency or thread pools, dynamic config reload, plugins. Each is a large
+renegotiation, client certificates, ALPN/HTTP/2, unbounded concurrency or
+thread pools, dynamic config reload, plugins. Each is a large
 state machine or a large dependency; each would multiply the surface this
 design exists to keep small. Concurrency is bounded on purpose: one forked,
-single-threaded process per in-flight request, capped by `--max-connections`.
+single-threaded process per connection, capped by `--max-connections`.
 
 ## What it does
 
@@ -105,13 +105,20 @@ single-threaded process per in-flight request, capped by `--max-connections`.
 - Speaks HTTP/1.1 or TLS 1.3 on the same listener. TLS is enabled only when
   both `--tls-cert` and `--tls-key` are supplied; without them the server is
   plaintext exactly as before.
-- Serves requests concurrently: the listener forks one short-lived child per
-  request, up to `--max-connections` (default 64). Beyond that a plaintext
+- Serves connections concurrently: the listener forks one child per
+  connection, up to `--max-connections` (default 64). A child serves at most
+  100 requests on that connection. Beyond the cap a plaintext
   client gets `503 Service Unavailable` with `Retry-After: 1`; a TLS client
   cannot parse a plaintext error, so the connection is closed instead of
   queueing forever.
-- Reads a bounded request head with a hard per-request deadline (default 5 s),
-  answers, and closes. A client that stalls gets `408`.
+- Reads each bounded request head with a hard per-request deadline (default
+  5 s). HTTP/1.1 connections persist by default; HTTP/1.0 requires
+  `Connection: keep-alive`. `Connection: close` ends persistence. A client that
+  stalls while a request is incomplete gets `408`; an idle persistent
+  connection is closed after the same timeout.
+- Request bodies are unsupported: nonzero `Content-Length`, duplicate length
+  fields, and any `Transfer-Encoding` are rejected with `400` and the
+  connection closes. Pipelined request bytes are buffered and preserved.
 - Routes:
 
   | Request          | Response                          |
@@ -123,9 +130,9 @@ single-threaded process per in-flight request, capped by `--max-connections`.
   | other method     | 405 with `Allow: GET, HEAD`       |
   | malformed        | 400 / 414 / 431 / 505 as appropriate |
 
-- Sends `Date`, `Content-Type`, `Content-Length`, `Connection: close`,
-  `Cache-Control: no-store`, and `X-Content-Type-Options: nosniff`, so every
-  response is complete and the client knows exactly where it ends. TLS
+- Sends `Date`, `Content-Type`, `Content-Length`, the appropriate `Connection`
+  header, `Cache-Control: no-store`, and `X-Content-Type-Options: nosniff`, so
+  every response is complete and the client knows exactly where it ends. TLS
   responses add `Strict-Transport-Security: max-age=31536000`.
 - Logs one access line per request to `stderr` (method, path, status, bytes,
   duration). Failed TLS handshakes are logged separately, without request data,
@@ -220,10 +227,11 @@ An HTTP server is a byte pipeline with one required loop:
 4. **Block in `accept`** - each call returns a new connected socket.
 5. **Read the request** - HTTP is text until `\r\n\r\n` (end of headers). The
    first line is `METHOD SP TARGET SP VERSION`, so a bounded parse of that line
-   is enough for routing. Bodies are not read; `GET`/`HEAD` do not need them,
-   and the connection closes afterwards.
+   is enough for routing. Bodies are not supported; non-empty bodies are
+   rejected so their bytes cannot be confused with a later request.
 6. **Write the response** - status line, headers, blank line, body. The client
-   finds the body end via `Content-Length`; the connection then closes.
+   finds the body end via `Content-Length`; a persistent connection may then
+   carry another bounded request.
 7. **Close and loop.**
 
 That is the whole protocol surface this server needs. Production hardening
@@ -232,7 +240,8 @@ adds only bounded work around that loop:
 - a fixed 8 KiB request cap and a 1 KiB target cap (`431`, `414`);
 - a total request deadline, not just per-`recv` socket timeouts, so a slowloris
   client cannot hold a slot indefinitely (`408`);
-- one forked worker per request, capped at 64, with `SIGCHLD` reaping;
+- one forked worker per connection, capped at 64, handling at most 100
+  requests with `SIGCHLD` reaping;
 - `503` + `Retry-After` when the cap is reached, rather than unbounded forks;
 - signal-driven drain with a deadline, so deploys do not cut responses off;
 - one structured access-log line per request, with client-controlled fields
@@ -273,8 +282,9 @@ the OS default for `IPV6_V6ONLY` is left alone.
 
 - The parent accepts, enforces the connection cap, forks, and reaps. It never
   parses a request or touches TLS state; each child runs its own handshake.
-- Each child serves exactly one request, then `_exit`s. A crash in a child
-  cannot take down the listener; the parent logs a non-zero exit.
+- Each child serves up to 100 requests on one connection, then `_exit`s. A
+  crash in a child cannot take down the listener; the parent logs a non-zero
+  exit.
 - At the cap, new plaintext connections get `503` + `Retry-After: 1`, then
   close. TLS connections are closed without a response. The parent reaps
   first, so a just-finished request frees its slot immediately.
@@ -526,7 +536,7 @@ Two limits are real, not papered over:
   put stdout `printf` in code you intend to run under Valgrind.
 
 **`make trace`** runs `strace -f -e trace=network` around the static server,
-makes one request, and stops it. `-f` follows the per-request fork, so the log
+makes one request, and stops it. `-f` follows the per-connection fork, so the log
 contains both the listener and the worker. It works on the static binary
 because strace observes syscalls, not the Fil-C ABI:
 
@@ -557,11 +567,12 @@ not substitutes.
 
 ## Notes and limits
 
-- One request per connection (`Connection: close`), served by a forked,
-  single-threaded child per in-flight request. Concurrency is capped by
-  `--max-connections` (64 by default); there is no thread pool or event loop.
+- HTTP/1.1 keep-alive (HTTP/1.0 opt-in), served by a forked, single-threaded
+  child per connection. Each child handles at most 100 requests. Concurrency is
+  capped by `--max-connections` (64 by default); there is no thread pool or
+  event loop.
 - Production-ready within this deliberately small feature set, not a general
-  web server: no keep-alive, chunked transfer, request bodies, compression,
+  web server: no chunked transfer, request bodies, compression,
   virtual hosts, range requests, or dynamic content. It serves two built-in
   routes.
 - TLS is a narrow, opt-in profile: TLS 1.3, X25519, Ed25519 certificates,

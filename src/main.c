@@ -2,11 +2,11 @@
  * chttp - a minimal, production-hardened HTTP/1.1 server.
  *
  * One listening process accepts a connection and forks a child that serves
- * exactly one request. Concurrency is bounded, every wait has a deadline, and
- * shutdown drains in-flight requests before exiting.
+ * a bounded number of requests. Concurrency is bounded, every wait has a
+ * deadline, and shutdown drains in-flight requests before exiting.
  *
- * Serves GET and HEAD only, over plaintext or TLS 1.3. No keep-alive,
- * chunked bodies, or config files; configuration is flags plus environment
+ * Serves GET and HEAD only, over plaintext or TLS 1.3. No chunked transfer
+ * encoding or config files; configuration is flags plus environment
  * variables.
  */
 
@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -42,6 +43,7 @@
 
 #define REQUEST_MAX 8192 /* whole request head, including CRLF CRLF */
 #define URI_MAX     1024 /* request-target, including '/' */
+#define KEEPALIVE_MAX_REQUESTS 100
 
 #define DRAIN_MS      5000 /* let in-flight requests finish after SIGTERM */
 #define TERM_GRACE_MS 1000 /* then ask them to stop */
@@ -589,7 +591,7 @@ static long send_all(int fd, const void *data, size_t length)
 }
 
 static int build_header(const struct response *response, char *buffer,
-                        size_t capacity, int secure)
+                        size_t capacity, int secure, int keep_alive)
 {
     char date[40];
     const char *allow = (response->flags & RESP_ALLOW) != 0
@@ -598,6 +600,7 @@ static int build_header(const struct response *response, char *buffer,
                       ? "Retry-After: 1\r\n" : "";
     const char *hsts = secure
                      ? "Strict-Transport-Security: max-age=31536000\r\n" : "";
+    const char *connection = keep_alive ? "keep-alive" : "close";
     int written;
 
     format_http_date(date, sizeof date);
@@ -606,14 +609,14 @@ static int build_header(const struct response *response, char *buffer,
                        "Date: %s\r\n"
                        "Content-Type: %s\r\n"
                        "Content-Length: %zu\r\n"
-                       "Connection: close\r\n"
+                       "Connection: %s\r\n"
                        "Cache-Control: no-store\r\n"
                        "X-Content-Type-Options: nosniff\r\n"
                        "%s%s%s"
                        "\r\n",
                        response->status, response->reason, date,
                        response->content_type, response->body_len,
-                       hsts, allow, retry);
+                       connection, hsts, allow, retry);
     if (written < 0 || (size_t)written >= capacity)
         return -1;
     return written;
@@ -638,10 +641,11 @@ static long connection_write_all(struct connection *conn, const void *data,
 }
 
 static long respond(struct connection *conn, const struct response *response,
-                    int include_body, int secure)
+                    int include_body, int secure, int keep_alive)
 {
     char buffer[2048];
-    int header_length = build_header(response, buffer, sizeof buffer, secure);
+    int header_length = build_header(response, buffer, sizeof buffer, secure,
+                                     keep_alive);
     size_t total;
 
     if (header_length < 0)
@@ -683,7 +687,7 @@ static void reject_busy(int fd, const char *peer, int tls_enabled)
         log_access(peer, "-", "-", "-", RESP_503.status, -1, 0);
         return;
     }
-    header_length = build_header(&RESP_503, buffer, sizeof buffer, 0);
+    header_length = build_header(&RESP_503, buffer, sizeof buffer, 0, 0);
     if (header_length > 0
         && (size_t)header_length + RESP_503.body_len <= sizeof buffer) {
         ssize_t written;
@@ -818,13 +822,25 @@ enum read_result {
 };
 
 static enum read_result read_headers(struct connection *conn, char *buffer,
-                                     size_t capacity, size_t *used_out)
+                                     size_t capacity, size_t *used_out,
+                                     char *carry, size_t *pending)
 {
-    size_t used = 0;
+    size_t used = *pending;
+    if (used != 0)
+        memcpy(buffer, carry, used);
+    *pending = 0;
 
     for (;;) {
         ssize_t received;
-
+        char *end = memmem(buffer, used, "\r\n\r\n", 4);
+        if (end != NULL) {
+            size_t header = (size_t)(end - buffer) + 4;
+            *pending = used - header;
+            if (*pending != 0)
+                memcpy(carry, buffer + header, *pending);
+            *used_out = header;
+            return READ_OK;
+        }
         if (used == capacity)
             return READ_TOO_LARGE;
         if (ms_since(conn->start) >= conn->timeout_ms)
@@ -850,9 +866,16 @@ static enum read_result read_headers(struct connection *conn, char *buffer,
             return READ_BAD;
 
         used += (size_t)received;
-        if (memmem(buffer, used, "\r\n\r\n", 4) != NULL) {
-            *used_out = used;
-            return READ_OK;
+        {
+            char *end = memmem(buffer, used, "\r\n\r\n", 4);
+            if (end != NULL) {
+                size_t header = (size_t)(end - buffer) + 4;
+                *pending = used - header;
+                if (*pending != 0)
+                    memcpy(carry, buffer + header, *pending);
+                *used_out = header;
+                return READ_OK;
+            }
         }
     }
 }
@@ -860,12 +883,76 @@ static enum read_result read_headers(struct connection *conn, char *buffer,
 static void finish_response(struct connection *conn, const char *peer,
                             const struct response *response, int include_body,
                             const struct request_info *info,
-                            const struct timespec *start, int secure)
+                            const struct timespec *start, int secure,
+                            int keep_alive)
 {
-    long bytes = respond(conn, response, include_body, secure);
+    long bytes = respond(conn, response, include_body, secure, keep_alive);
 
     log_access(peer, info->method, info->target, info->version,
                response->status, bytes, ms_since(start));
+}
+
+/* Return persistence policy and reject bodies: the server has no request-body
+ * API, so accepting one would make its bytes ambiguous with the next request. */
+static int request_keep_alive(char *request, int *keep_alive)
+{
+    char *line = strstr(request, "\r\n");
+    int close_seen = 0, keep_seen = 0, content_length_seen = 0;
+    int is_http11;
+
+    if (line == NULL)
+        return -1;
+    {
+        char *last = line;
+        while (last > request && last[-1] != ' ')
+            last--;
+        if (last == request)
+            return -1;
+        last--;
+        is_http11 = (size_t)(line - last - 1) == 8
+                 && memcmp(last + 1, "HTTP/1.1", 8) == 0;
+    }
+    line += 2;
+    while (*line != '\0' && !(line[0] == '\r' && line[1] == '\n')) {
+        char *end = strstr(line, "\r\n");
+        char *colon;
+        if (end == NULL)
+            return -1;
+        *end = '\0';
+        colon = strchr(line, ':');
+        if (colon == NULL || colon == line)
+            return -1;
+        *colon++ = '\0';
+        if (!is_token(line))
+            return -1;
+        while (*colon == ' ' || *colon == '\t') colon++;
+        if (strcasecmp(line, "Connection") == 0) {
+            char *save = NULL;
+            char *token = strtok_r(colon, ",", &save);
+            if (token == NULL)
+                return -1;
+            do {
+                char *tail;
+                while (*token == ' ' || *token == '\t') token++;
+                tail = token + strlen(token);
+                while (tail > token && (tail[-1] == ' ' || tail[-1] == '\t'))
+                    *--tail = '\0';
+                if (!is_token(token))
+                    return -1;
+                if (strcasecmp(token, "close") == 0) close_seen = 1;
+                if (strcasecmp(token, "keep-alive") == 0) keep_seen = 1;
+                token = strtok_r(NULL, ",", &save);
+            } while (token != NULL);
+        } else if (strcasecmp(line, "Content-Length") == 0) {
+            if (content_length_seen++ || strcmp(colon, "0") != 0)
+                return -1;
+        } else if (strcasecmp(line, "Transfer-Encoding") == 0) {
+            return -1;
+        }
+        line = end + 2;
+    }
+    *keep_alive = !close_seen && (is_http11 || keep_seen);
+    return 0;
 }
 
 static void handle_client(int fd, const char *peer, const struct config *cfg,
@@ -876,6 +963,8 @@ static void handle_client(int fd, const char *peer, const struct config *cfg,
     struct timespec start;
     struct connection conn;
     char request[REQUEST_MAX + 1];
+    char carry[REQUEST_MAX];
+    size_t pending = 0;
     size_t used = 0;
     enum read_result result;
     int secure = credentials != NULL;
@@ -903,30 +992,51 @@ static void handle_client(int fd, const char *peer, const struct config *cfg,
         }
     }
 
-    result = read_headers(&conn, request, REQUEST_MAX, &used);
-    switch (result) {
-    case READ_EMPTY:
-        goto out;
-    case READ_ABORT:
-        log_access(peer, "-", "-", "-", 499, 0, ms_since(&start));
-        goto out;
-    case READ_TIMEOUT:
-        finish_response(&conn, peer, &RESP_408, 1, &info, &start, secure);
-        goto out;
-    case READ_TOO_LARGE:
-        finish_response(&conn, peer, &RESP_431, 1, &info, &start, secure);
-        goto out;
-    case READ_BAD:
-        finish_response(&conn, peer, &RESP_400, 1, &info, &start, secure);
-        goto out;
-    case READ_OK:
-        break;
+    for (int count = 0; count < KEEPALIVE_MAX_REQUESTS; count++) {
+        int keep_alive = 0;
+        info = (struct request_info){ "-", "-", "-", 1 };
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        result = read_headers(&conn, request, REQUEST_MAX, &used, carry,
+                              &pending);
+        switch (result) {
+        case READ_EMPTY:
+            goto out;
+        case READ_ABORT:
+            log_access(peer, "-", "-", "-", 499, 0, ms_since(&start));
+            goto out;
+        case READ_TIMEOUT:
+            finish_response(&conn, peer, &RESP_408, 1, &info, &start,
+                            secure, 0);
+            goto out;
+        case READ_TOO_LARGE:
+            finish_response(&conn, peer, &RESP_431, 1, &info, &start,
+                            secure, 0);
+            goto out;
+        case READ_BAD:
+            finish_response(&conn, peer, &RESP_400, 1, &info, &start,
+                            secure, 0);
+            goto out;
+        case READ_OK:
+            break;
+        }
+        request[used] = '\0';
+        if (request_keep_alive(request, &keep_alive) < 0) {
+            finish_response(&conn, peer, &RESP_400, 1, &info, &start,
+                            secure, 0);
+            goto out;
+        }
+        route_request(request, &info, &response);
+        if (response.status == 400 || response.status == 408
+            || response.status == 414 || response.status == 431
+            || response.status == 505)
+            keep_alive = 0;
+        if (count + 1 == KEEPALIVE_MAX_REQUESTS)
+            keep_alive = 0;
+        finish_response(&conn, peer, &response, info.include_body, &info,
+                        &start, secure, keep_alive);
+        if (!keep_alive)
+            goto out;
     }
-
-    request[used] = '\0';
-    route_request(request, &info, &response);
-    finish_response(&conn, peer, &response, info.include_body, &info, &start,
-                    secure);
 
 out:
     if (conn.tls != NULL) {

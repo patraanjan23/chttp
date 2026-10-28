@@ -255,6 +255,13 @@ body=$(curl -fsS --max-time 10 --cacert "$CA" \
 [ "$body" = "ok" ] || fail "HTTPS GET /health returned '$body'"
 ok "curl verifies the Ed25519 certificate and gets /health"
 
+body=$(curl -fsS --http1.1 --max-time 10 --cacert "$CA" \
+    "https://127.0.0.1:$SERVER_PORT/health" \
+    "https://127.0.0.1:$SERVER_PORT/health")
+[ "$(grep -c '^ok$' <<<"$body")" -eq 2 ] \
+    || fail "HTTPS keep-alive did not serve both requests"
+ok "HTTPS requests reuse a persistent connection"
+
 headers=$(curl -fsS --max-time 10 --cacert "$CA" -D - -o /dev/null \
     "https://127.0.0.1:$SERVER_PORT/")
 status=${headers%%$'\n'*}

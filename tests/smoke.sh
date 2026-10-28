@@ -191,7 +191,31 @@ headers=$(curl -fsS -D - -o /dev/null "http://127.0.0.1:$SERVER_PORT/")
 expect_code "$headers" 200 "GET / is 200"
 expect_header "$headers" '^Date: ' "Date header present"
 expect_header "$headers" '^Content-Length: [0-9]+' "Content-Length present"
-expect_header "$headers" '^Connection: close' "Connection close advertised"
+expect_header "$headers" '^Connection: keep-alive' "HTTP/1.1 persistence advertised"
+
+response=$(raw 'GET /health HTTP/1.1\r\nHost: test\r\n\r\nGET / HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n')
+[ "$(grep -c '^HTTP/1.1 200' <<<"$response")" -eq 2 ] \
+    || fail "pipelined keep-alive requests were not both served"
+ok "pipelined requests share one connection and close is honored"
+
+response=$(raw 'GET /health HTTP/1.0\r\nConnection: keep-alive\r\n\r\nGET /health HTTP/1.0\r\n\r\n')
+[ "$(grep -c '^HTTP/1.1 200' <<<"$response")" -eq 2 ] \
+    || fail "HTTP/1.0 keep-alive opt-in was not honored"
+ok "HTTP/1.0 persistence requires explicit opt-in"
+
+requests=$(for _ in $(seq 1 99); do
+    printf 'GET /health HTTP/1.1\r\nHost: test\r\n\r\n'
+done
+printf 'GET /health HTTP/1.1\r\nHost: test\r\n\r\nX')
+response=$(raw "$requests")
+[ "$(grep -c '^HTTP/1.1 200' <<<"$response")" -eq 100 ] \
+    || fail "connection request cap did not serve exactly 100 requests"
+grep -q '^Connection: close' <<<"${response##*HTTP/1.1}" \
+    || fail "100th response did not advertise close"
+ok "connection is closed after the bounded 100-request limit"
+
+response=$(raw 'POST / HTTP/1.1\r\nHost: test\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx')
+expect_code "$response" 400 "request bodies are rejected safely"
 
 body=$(curl -fsS "http://127.0.0.1:$SERVER_PORT/health?probe=1")
 [ "$body" = "ok" ] || fail "GET /health?probe=1 returned '$body'"
@@ -207,14 +231,14 @@ headers=$(curl -sS -D - -o /dev/null -X POST \
 expect_code "$headers" 405 "POST is 405"
 expect_header "$headers" '^Allow: GET, HEAD' "405 advertises Allow"
 
-response=$(raw 'HEAD / HTTP/1.1\r\nHost: test\r\n\r\n')
+response=$(raw 'HEAD / HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n')
 expect_code "$response" 200 "HEAD / is 200"
 case "$response" in
     *"hello from Fil-C"*) fail "HEAD / returned a body" ;;
 esac
 ok "HEAD / has no body"
 
-response=$(raw 'HEAD /health HTTP/1.1\r\nHost: test\r\n\r\n')
+response=$(raw 'HEAD /health HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n')
 expect_code "$response" 200 "HEAD /health is 200"
 case "$response" in
     *$'\r\n\r\nok'*) fail "HEAD /health returned a body" ;;
@@ -224,12 +248,12 @@ ok "HEAD /health has no body"
 response=$(raw 'NOT A REQUEST\r\n\r\n')
 expect_code "$response" 400 "malformed request line is 400"
 
-response=$(raw 'GET / HTTP/9.9\r\nHost: test\r\n\r\n')
+response=$(raw 'GET / HTTP/9.9\r\nHost: test\r\nConnection: close\r\n\r\n')
 expect_code "$response" 505 "unsupported HTTP version is 505"
 
 echo "== limits =="
 long_path="/$(head -c 2000 /dev/zero | tr '\0' 'a')"
-response=$(raw "GET $long_path HTTP/1.1\r\nHost: test\r\n\r\n")
+response=$(raw "GET $long_path HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
 expect_code "$response" 414 "oversized URI is 414"
 
 padding=$(head -c 9000 /dev/zero | tr '\0' 'A')
