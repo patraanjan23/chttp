@@ -2,6 +2,12 @@
 # Integration checks for the in-tree TLS 1.3 stack: the opt-in profile,
 # OpenSSL/curl interoperability, credential loading, the protocol boundary,
 # timeouts, the connection cap, and plaintext/HSTS behaviour.
+#
+# Checks exercise client *behaviour*, so each one runs on every generation
+# of s_client that can reach it. The one exception is interop with the
+# X25519MLKEM768 post-quantum hybrid group, which only clients with ML-KEM
+# support can configure at all (OpenSSL >= 3.5); such clients skip that
+# check loudly instead of failing, and everything else still runs.
 set -euo pipefail
 
 BIN=${BIN:-./build/chttp}
@@ -32,6 +38,12 @@ fail() {
 }
 
 ok() { echo "ok: $*"; }
+
+# Like ok(), but marks a check this client generation cannot run. Skips are
+# loud, greppable, and always a client-capability verdict, never a
+# "feature not implemented" state: a check is skipped only when the client
+# provably lacks the mechanism the check exercises.
+skip() { echo "skip: $*"; }
 
 command -v openssl >/dev/null 2>&1 || fail "openssl is required for the TLS suite"
 
@@ -316,7 +328,10 @@ grep -q 'Verification: OK' <<<"$probe" \
     || fail "s_client did not verify the certificate"
 grep -qi 'Signature type: ed25519' <<<"$probe" \
     || fail "s_client did not report an Ed25519 signature"
-grep -qi 'Peer Temp Key: X25519' <<<"$probe" \
+# OpenSSL 3.5 reworked s_client's summary output: "Peer Temp Key" in newer
+# generations, "Server Temp Key" in the 3.0-3.4 lines. Both lines state the
+# same negotiated fact, so accept either client generation.
+grep -Eqi '(Peer|Server) Temp Key: X25519' <<<"$probe" \
     || fail "s_client did not report an X25519 key"
 ok "openssl s_client verifies the chain and negotiates the profile"
 
@@ -326,11 +341,40 @@ direct=$(timeout 20 openssl s_client -connect "127.0.0.1:$SERVER_PORT" \
 [ "$direct" = 1 ] || fail "X25519 key share unexpectedly needed $direct ClientHellos"
 ok "an X25519 key share is accepted without HelloRetryRequest"
 
+# The server profile is X25519-only. A client that offers the groups
+# P-256:X25519 but sends a key share only for its preferred (first)
+# group, P-256, leaves the server no usable share: under RFC 8446 4.1.2 the server
+# answers with HelloRetryRequest and the visible X25519 share arrives in
+# ClientHello #2. This needs nothing newer than a TLS 1.3 client, so the
+# check runs on every supported client generation.
 retry=$(timeout 20 openssl s_client -connect "127.0.0.1:$SERVER_PORT" \
-    -tls1_3 -groups X25519MLKEM768:X25519 -CAfile "$CA" -msg </dev/null 2>&1 \
+    -tls1_3 -groups 'P-256:X25519' -CAfile "$CA" -msg </dev/null 2>&1 \
     | grep -c '], ClientHello' || true)
-[ "$retry" -ge 2 ] || fail "a post-quantum key share did not trigger HelloRetryRequest"
-ok "a PQ-hybrid key share triggers HelloRetryRequest"
+[ "$retry" = 2 ] || fail "no usable key share did not trigger exactly one HelloRetryRequest ($retry ClientHellos)"
+ok "a mid-profile key share triggers exactly one HelloRetryRequest"
+
+# Interop with the post-quantum hybrid group real-world 3.5+ clients
+# default to. Capabilities, not versions, drive the gate: probe whether
+# the client can select X25519MLKEM768 at all (the probe connects to a
+# dead port; a capable client fails the connection, an incapable one
+# fails at configuration). Everything else, including a handshake that
+# gets past the probe but then misbehaves, still runs and can fail.
+mlkem_cap=$(timeout 10 openssl s_client -tls1_3 \
+    -groups 'X25519MLKEM768:X25519' -connect '127.0.0.1:1' \
+    </dev/null 2>&1 || true)
+case "$mlkem_cap" in
+*"cannot be set"*)
+    skip "post-quantum hybrid interop needs a client that supports X25519MLKEM768 (OpenSSL >= 3.5)"
+    ;;
+*)
+    pgretry=$(timeout 20 openssl s_client -connect "127.0.0.1:$SERVER_PORT" \
+        -tls1_3 -groups X25519MLKEM768:X25519 -CAfile "$CA" -msg </dev/null 2>&1 \
+        | grep -c '], ClientHello' || true)
+    [ "$pgretry" -ge 2 ] || \
+        fail "a post-quantum key share did not trigger HelloRetryRequest"
+    ok "a PQ-hybrid key share triggers HelloRetryRequest"
+    ;;
+esac
 
 echo "== protocol boundary =="
 if curl -sS --max-time 10 --cacert "$CA" --tlsv1.2 --tls-max 1.2 \
