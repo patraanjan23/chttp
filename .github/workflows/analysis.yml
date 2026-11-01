@@ -239,8 +239,11 @@ jobs:
               return 0;
           }
           EOF
-          CC="$RUNNER_TEMP/perefil"/*linux-*/build/bin/filcc
-          "$CC" -O1 -o build/bindprobe /tmp/bindprobe.c
+          # Assignment contexts do not glob-expand: resolve the filcc
+          # path explicitly here (unlike the make CC=... lines, which are
+          # command arguments and expand normally).
+          filcc=$(ls -1 "$RUNNER_TEMP"/perefil/*linux-*/build/bin/filcc | head -n1)
+          "$filcc" -O1 -o build/bindprobe /tmp/bindprobe.c
           file build/bindprobe
 
       - name: Test suites (crypto, HTTP smoke, TLS)
