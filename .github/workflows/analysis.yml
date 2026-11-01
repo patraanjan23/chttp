@@ -1,0 +1,231 @@
+# Scheduled Fil-C analysis runs for chttp.
+#
+# Coverage of every platform Fil-C supports:
+#
+#   Native hosts (full analysis: compile, run, analyze, strace, valgrind)
+#     - Linux/x86_64 on Ubuntu 24.04 and 26.04 hosted runners
+#     - Linux/ARM64 on Ubuntu 24.04 and 26.04 hosted runners
+#     Fil-C works natively on Linux/x86_64 and Linux/ARM64 only; those are
+#     the only hosts where filcc itself, the clang static analyzer
+#     (`make analyze`), strace, and Valgrind can run.
+#
+#   Peregrine Fil-C cross-compilation targets (build + smoke test)
+#     - Linux/x86_64 and Linux/ARM64, Darwin/ARM64 (macOS), Windows/x86_64:
+#       perefil-<ver>-linux-x86_64 builds fat APEs -- one file that runs on
+#       Linux, macOS, and the BSDs (both x86_64 and ARM64) and on
+#       Windows/x86_64. The portable build + full `make check` runs on a
+#       Linux/x86_64 host (the only host Peregrine supports), then the
+#       binary is smoke-tested on macOS/ARM64 and Windows/x86_64 runners.
+#     Peregrine is experimental per the Fil-C release notes; this job's
+#     failures are useful signal.
+#
+# Runs every 6 hours and on demand via the Actions UI.
+
+name: analysis
+
+on:
+  schedule:
+    # 00:00, 06:00, 12:00, 18:00 UTC.
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: analysis
+  cancel-in-progress: false
+
+env:
+  # Fil-C release to analyze with. Keep in sync with the local toolchain
+  # documented in handoff.md; bump when a new Fil-C release ships.
+  FILC_VERSION: "0.687"
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Native Fil-C hosts: Linux/x86_64 and Linux/ARM64.
+  # Full analysis here: build, test, static analysis, strace, valgrind.
+  # ---------------------------------------------------------------------
+  native:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runs-on: ubuntu-24.04
+            arch: x86_64
+            name: "Ubuntu 24.04 x86_64"
+          - runs-on: ubuntu-26.04
+            arch: x86_64
+            name: "Ubuntu 26.04 x86_64"
+          - runs-on: ubuntu-24.04-arm
+            arch: aarch64
+            name: "Ubuntu 24.04 ARM64"
+          - runs-on: ubuntu-26.04-arm
+            arch: aarch64
+            name: "Ubuntu 26.04 ARM64"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install analysis tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xz-utils strace valgrind curl openssl
+
+      - name: Install Fil-C (${{ env.FILC_VERSION }} ${{ matrix.arch }})
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/filc"
+          mkdir -p "$dir"
+          url="https://github.com/pizlonator/fil-c/releases/download/v${FILC_VERSION}/filc-${FILC_VERSION}-linux-${{ matrix.arch }}.tar.xz"
+          echo "Downloading $url"
+          curl -fsSL --retry 3 -o "$dir/filc.tar.xz" "$url"
+          tar -xJf "$dir/filc.tar.xz" -C "$dir"
+          cd "$dir"/*linux-*
+          ./setup.sh
+          echo "$PWD/build/bin" >> "$GITHUB_PATH"
+          "$PWD/build/bin/filcc" --version
+
+      - name: Build (static)
+        run: make -j2
+
+      - name: Test suites (crypto, HTTP smoke, TLS)
+        run: make check
+
+      - name: Clang static analyzer
+        run: make analyze
+
+      - name: strace network syscalls
+        run: make trace TRACE=1
+
+      - name: Valgrind (dynamic build)
+        run: make valgrind
+
+      - name: Collect logs
+        if: always()
+        run: |
+          # Keep whatever evidence the run produced for the job summary.
+          for f in build/strace.log build/valgrind.log; do
+            [ -f "$f" ] || continue
+            echo "## $f" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            echo "---8<--- (first 100 lines)" >> "$GITHUB_STEP_SUMMARY"
+            head -100 "$f" >> "$GITHUB_STEP_SUMMARY" || true
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          done
+
+  # ---------------------------------------------------------------------
+  # Peregrine Fil-C: portable cross-build (host must be Linux/x86_64).
+  # Produces fat APEs that run on Linux, macOS, and the BSDs (both CPU
+  # architectures) and on Windows/x86_64. Full `make check` runs here, then
+  # the APE binaries are uploaded for the smoke jobs below.
+  # ---------------------------------------------------------------------
+  portable-build:
+    name: "Peregrine portable build + check (Linux x86_64)"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build host deps
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          # Peregrine links the aarch64 half of the fat APE and needs its
+          # binutils; xz is preinstalled on runners but explicit is safer.
+          sudo apt-get install -y --no-install-recommends \
+            xz-utils binutils-aarch64-linux-gnu
+
+      - name: Install Peregrine Fil-C (${{ env.FILC_VERSION }})
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/perefil"
+          mkdir -p "$dir"
+          url="https://github.com/pizlonator/fil-c/releases/download/v${FILC_VERSION}/perefil-${FILC_VERSION}-linux-x86_64.tar.xz"
+          echo "Downloading $url"
+          curl -fsSL --retry 3 -o "$dir/perefil.tar.xz" "$url"
+          tar -xJf "$dir/perefil.tar.xz" -C "$dir"
+          cd "$dir"/*linux-*
+          # Links Linux headers into pizfix/os-include and fixes slicers.
+          ./setup.sh
+          echo "$PWD/build/bin" >> "$GITHUB_PATH"
+          "$PWD/build/bin/filcc" --version
+
+      - name: Build portable APEs
+        run: |
+          set -euo pipefail
+          make -j2 CC="$RUNNER_TEMP/perefil"/*linux-*/build/bin/filcc
+          # APE output also drops build/chttp.com.dbg (x86_64 ELF) and
+          # build/chttp.aarch64.elf (ARM64 ELF) side files for debugging.
+          file build/chttp
+
+      - name: Test suites (crypto, HTTP smoke, TLS)
+        # Same suites the native jobs run, against the portable binary.
+        # Rebuild is skipped: build/chttp is already up to date.
+        run: make check CC="$RUNNER_TEMP/perefil"/*linux-*/build/bin/filcc
+
+      - name: Upload portable binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: portable-binaries
+          path: |
+            build/chttp
+            build/crypto_test
+          retention-days: 7
+
+  # ---------------------------------------------------------------------
+  # Peregrine targets: smoke tests on the platforms the fat APE supports.
+  # Full suites stay on the Linux build host; here we exercise the crypto
+  # known-answer vectors and the core HTTP surface of the same binary.
+  # The .com suffix is required for Windows to recognise the APE as a PE.
+  # ---------------------------------------------------------------------
+  portable-smoke:
+    name: ${{ matrix.name }}
+    needs: portable-build
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runs-on: macos-latest
+            name: "Peregrine smoke on macOS (Darwin/ARM64)"
+          - runs-on: windows-latest
+            name: "Peregrine smoke on Windows (x86_64)"
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: portable-binaries
+
+      - name: Smoke test (crypto + HTTP)
+        shell: bash
+        run: |
+          set -e
+          # .com suffix is required for Windows to exec the APE as a PE.
+          cp chttp chttp.com
+          cp crypto_test crypto_test.com
+          chmod +x chttp.com crypto_test.com
+          ./crypto_test.com
+          port=$((20000 + $RANDOM % 20000))
+          ./chttp.com --port "$port" --timeout 3 --max-connections 4 \
+            >/dev/null 2>&1 &
+          pid=$!
+          trap 'kill $pid 2>/dev/null || true' EXIT
+          for i in $(seq 1 50); do
+            curl -fsS --max-time 1 "http://127.0.0.1:$port/health" \
+              >/dev/null 2>&1 && break
+            sleep 0.3
+          done
+          curl -fsS --max-time 3 "http://127.0.0.1:$port/" \
+            | grep -q "hello from Fil-C"
+          curl -fsS --max-time 3 --data-binary hello \
+            "http://127.0.0.1:$port/" | grep -qx hello
+          # SIGTERM is the server's graceful drain: the parent forwards it
+          # to the workers, so killing the parent is enough on any OS.
+          kill "$pid" 2>/dev/null || true
+          sleep 1
+          echo "ok: portable APE serves HTTP ($RUNNER_OS, $RUNNER_ARCH)"
