@@ -163,6 +163,86 @@ jobs:
           # build/chttp.aarch64.elf (ARM64 ELF) side files for debugging.
           file build/chttp
 
+      - name: Build POSIX bind probe
+        # Diagnostic only, not part of the check suite: reproduces the
+        # exact socket/setsockopt/bind sequence bind_listener() uses, in
+        # its CLOEXEC/plain and loopback/wildcard variants, plus what
+        # getaddrinfo returns for "127.0.0.1" on each target host. Run by
+        # the smoke jobs to attribute their bind failures.
+        run: |
+          set -euo pipefail
+          cat > /tmp/bindprobe.c <<'EOF'
+          #include <arpa/inet.h>
+          #include <errno.h>
+          #include <netdb.h>
+          #include <stdio.h>
+          #include <string.h>
+          #include <sys/socket.h>
+          #include <unistd.h>
+
+          static void try_bind(int cloexec, int loopback, int port) {
+              int s = socket(AF_INET, SOCK_STREAM | (cloexec ? SOCK_CLOEXEC : 0),
+                             IPPROTO_TCP);
+              if (s < 0) {
+                  printf("bindprobe: (cloexec=%d loopback=%d) socket: %s\n",
+                         cloexec, loopback, strerror(errno));
+                  return;
+              }
+              int reuse = 1;
+              if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &reuse,
+                             sizeof reuse) < 0) {
+                  printf("bindprobe: (cloexec=%d loopback=%d) setsockopt: %s\n",
+                         cloexec, loopback, strerror(errno));
+                  close(s);
+                  return;
+              }
+              struct sockaddr_in sa;
+              memset(&sa, 0, sizeof sa);
+              sa.sin_family = AF_INET;
+              sa.sin_port = htons((unsigned short)port);
+              sa.sin_addr.s_addr = htonl(loopback ? 0x7f000001 : INADDR_ANY);
+              if (bind(s, (struct sockaddr *)&sa, sizeof sa) < 0) {
+                  printf("bindprobe: (cloexec=%d loopback=%d) bind: %s\n",
+                         cloexec, loopback, strerror(errno));
+                  close(s);
+                  return;
+              }
+              printf("bindprobe: (cloexec=%d loopback=%d) ok\n",
+                     cloexec, loopback);
+              close(s);
+          }
+
+          int main(void) {
+              int port = 24311;
+              try_bind(0, 1, port);
+              try_bind(1, 1, port + 1);
+              try_bind(0, 0, port + 2);
+              try_bind(1, 0, port + 3);
+              struct addrinfo hints, *results = NULL;
+              memset(&hints, 0, sizeof hints);
+              hints.ai_family = AF_UNSPEC;
+              hints.ai_socktype = SOCK_STREAM;
+              hints.ai_flags = AI_PASSIVE | AI_NUMERICSERV;
+              char port_text[8];
+              snprintf(port_text, sizeof port_text, "%d", port + 4);
+              int gai = getaddrinfo("127.0.0.1", port_text, &hints, &results);
+              if (gai != 0) {
+                  printf("bindprobe: getaddrinfo: %s\n", gai_strerror(gai));
+              } else {
+                  for (struct addrinfo *e = results; e != NULL; e = e->ai_next)
+                      printf("bindprobe: getaddrinfo entry: family=%d "
+                             "socktype=%d addrlen=%d\n",
+                             (int)e->ai_family, (int)e->ai_socktype,
+                             (int)e->ai_addrlen);
+                  freeaddrinfo(results);
+              }
+              return 0;
+          }
+          EOF
+          CC="$RUNNER_TEMP/perefil"/*linux-*/build/bin/filcc
+          "$CC" -O1 -o build/bindprobe /tmp/bindprobe.c
+          file build/bindprobe
+
       - name: Test suites (crypto, HTTP smoke, TLS)
         # Same suites the native jobs run, against the portable binary.
         # Rebuild is skipped: build/chttp is already up to date.
@@ -175,6 +255,7 @@ jobs:
           path: |
             build/chttp
             build/crypto_test
+            build/bindprobe
           retention-days: 7
 
   # ---------------------------------------------------------------------
@@ -200,6 +281,14 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: portable-binaries
+
+      - name: Bind probe (diagnostic)
+        shell: bash
+        run: |
+          # Always informative; output classifies the bind failure shape.
+          cp bindprobe bindprobe.com
+          chmod +x bindprobe.com
+          ./bindprobe.com
 
       - name: Smoke test (crypto + HTTP)
         shell: bash
