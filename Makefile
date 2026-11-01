@@ -5,7 +5,8 @@
 #   make check      build and run the crypto, HTTP, and TLS suites
 #   make analyze    clang static analyzer
 #   make valgrind   dynamic build under Valgrind (needs valgrind + curl)
-#   make trace      strace one exchange (needs strace + curl)
+#   make trace      explain optional strace; use TRACE=1 to run it
+#   make perf       informational HTTP benchmark (not part of make check)
 #   make install    install to $(PREFIX)/bin (default /usr/local)
 #   make clean      remove build artifacts
 
@@ -22,8 +23,15 @@ CRYPTOTEST := build/crypto_test
 SRC     := src/main.c src/tls.c src/crypto.c
 HEADERS := src/tls.h src/crypto.h
 
+# Prefer an installed compiler on PATH; also discover the local toolchain used
+# in this environment so routine make targets don't depend on shell setup.
 ifeq ($(shell command -v $(firstword $(CC)) 2>/dev/null),)
+FILC_LOCAL := $(lastword $(sort $(wildcard /root/toolchains/fil-c-*/build/bin/filcc)))
+ifneq ($(FILC_LOCAL),)
+override CC := $(FILC_LOCAL)
+else
 $(error $(CC) not found - install Fil-C and put its build/bin on PATH, or run make CC=/path/to/fil-c/build/bin/filcc)
+endif
 endif
 
 all: $(TARGET)
@@ -106,8 +114,10 @@ valgrind-tls: $(DYNBIN)
 	grep -q "ERROR SUMMARY: 0 errors" build/valgrind-tls.log; \
 	echo "ok: TLS valgrind found no errors (build/valgrind-tls.log)"
 
-# Syscall-level trace of one request/response exchange.
+# Optional syscall-level trace. Opt in explicitly; ptrace may be unavailable
+# (or noisy) inside Android/TermFold's PRoot environment.
 trace: $(TARGET)
+ifeq ($(TRACE),1)
 	@set -e; \
 	port=$$((20000 + $$$$ % 20000)); \
 	strace -f -e trace=network -o build/strace.log \
@@ -124,6 +134,9 @@ trace: $(TARGET)
 	kill -TERM $$child; \
 	wait $$spid; \
 	echo "ok: network syscalls in build/strace.log"
+else
+	@echo "Skipping optional strace target. On a ptrace-capable Linux host, run: make trace TRACE=1"
+endif
 
 run: $(TARGET)
 	./$(TARGET)
@@ -132,6 +145,10 @@ check: $(TARGET) $(CRYPTOTEST)
 	./$(CRYPTOTEST)
 	BIN=./$(TARGET) ./tests/smoke.sh
 	BIN=./$(TARGET) ./tests/tls.sh
+
+# Informational benchmark; intentionally excluded from make check.
+perf: $(TARGET)
+	python3 tests/perf.py ./$(TARGET)
 
 PREFIX     ?= /usr/local
 SYSCONFDIR ?= /etc
@@ -148,4 +165,4 @@ install-systemd:
 clean:
 	rm -rf build
 
-.PHONY: all run check clean analyze valgrind valgrind-tls trace install install-systemd
+.PHONY: all run check clean analyze valgrind valgrind-tls trace perf install install-systemd

@@ -506,12 +506,15 @@ does not (leaks, syscalls, dataflow) or double-check the program from outside.
 
 ```sh
 make analyze       # clang static analyzer (ships with Fil-C)
+make perf          # informational HTTP throughput/latency benchmark
 make valgrind      # dynamic build under Valgrind, scripted HTTP smoke test
 make valgrind-tls  # the same, plus one TLS handshake (slow)
-make trace         # strace one request/response, write build/strace.log
+make trace         # skip optional ptrace-based tracing by default
+make trace TRACE=1 # strace one exchange (Linux host; writes build/strace.log)
 ```
 
-Install the two external ones once:
+Valgrind and strace are optional external tools. Install them only if you
+intend to use those targets:
 
 ```sh
 apt-get install -y --no-install-recommends valgrind strace
@@ -549,10 +552,12 @@ Two limits are real, not papered over:
   therefore logs to `stderr`, which is unbuffered and skips that path. Do not
   put stdout `printf` in code you intend to run under Valgrind.
 
-**`make trace`** runs `strace -f -e trace=network` around the static server,
-makes one request, and stops it. `-f` follows the per-connection fork, so the log
-contains both the listener and the worker. It works on the static binary
-because strace observes syscalls, not the Fil-C ABI:
+**`make trace TRACE=1`** runs `strace -f -e trace=network` around the static
+server, makes one request, and stops it. `-f` follows the per-connection fork,
+so the log contains both the listener and the worker. Tracing is opt-in because
+it uses ptrace and may be unsupported or noisy inside Android/TermFold's PRoot
+environment. Plain `make trace` skips it. It works on the static binary because
+strace observes syscalls, not the Fil-C ABI:
 
 ```
 socket(AF_INET, SOCK_STREAM, IPPROTO_TCP) = 3
