@@ -6,11 +6,12 @@ TLS handshake and its crypto in the same tree, so HTTPS adds no library or
 package. The only unusual thing is the compiler: Fil-C checks every pointer
 access, so the code is memory-safe at run time.
 
-**Status: experimental software.** The design is production-ready in principle —
-bounded concurrency, hard per-request deadlines, strict parsing, access logs,
-backpressure, graceful drain on `SIGTERM`, and an opt-in TLS 1.3 profile. This
-code is not distributed as production software; treat it as experimental and
-expect the interfaces and feature surface to change.
+**Status: experimental.** chttp is an experiment in building a small,
+dependency-free, memory-safe HTTP/1.1 + TLS 1.3 server on Fil-C, written from
+first principles. The scope is deliberately fixed — bounded concurrency, hard
+per-request deadlines, strict parsing, access logs, backpressure, a graceful
+drain on `SIGTERM`, and an opt-in TLS 1.3 profile — and everything, including
+the interfaces, is subject to change.
 
 ```
 src/main.c            listener, HTTP parsing, routing
@@ -238,8 +239,8 @@ An HTTP server is a byte pipeline with one required loop:
    carry another bounded request.
 7. **Close and loop.**
 
-That is the whole protocol surface this server needs. Production hardening
-adds only bounded work around that loop:
+That is the whole protocol surface this server needs. Everything beyond that
+loop is bounded defensive work:
 
 - a fixed 8 KiB request cap and a 1 KiB target cap (`431`, `414`);
 - a total request deadline, not just per-`recv` socket timeouts, so a slowloris
@@ -251,7 +252,7 @@ adds only bounded work around that loop:
 - one structured access-log line per request, with client-controlled fields
   escaped before they reach the log.
 
-## Production operations
+## Operations
 
 ### Configuration
 
@@ -592,10 +593,9 @@ not substitutes.
   child per connection. Each child handles at most 100 requests. Concurrency is
   capped by `--max-connections` (64 by default); there is no thread pool or
   event loop.
-- Production-ready within this deliberately small feature set, not a general
-  web server: no request-body support beyond the bounded `POST /` echo,
-  compression, virtual hosts, range requests, or dynamic content. It serves
-  two built-in routes and the echo endpoint.
+- Small and deliberate, not a general web server: no request-body support
+  beyond the bounded `POST /` echo, compression, virtual hosts, range requests,
+  or dynamic content. It serves two built-in routes and the echo endpoint.
 - TLS is a narrow, opt-in profile: TLS 1.3, X25519, Ed25519 certificates,
   AES-128-GCM only. Clients that cannot offer that exact combination cannot
   connect. There is no certificate hot-reload (restart to rotate), no SNI
