@@ -638,3 +638,19 @@ filcc -O2 -g -o /tmp/oob /tmp/oob.c && /tmp/oob
 The process aborts with a `filc safety error` naming the source line and the
 heap object. (The allocator has a 16-byte minimum block, so a small `p[1]`
 overrun on a 4-byte object can land inside that block; `p[10]` is caught.)
+
+## License
+
+Copyright (c) 2026 Dipanjan Patra.
+
+chttp is free software, licensed under the **GNU Affero General Public License
+v3.0** (`LICENSE`). You may use, study, modify, and redistribute it under AGPLv3
+terms; if you offer modified versions as a network service, AGPLv3 requires you
+to offer your source to those users.
+
+If you want to use chttp in a closed-source product, or under terms that do not
+require copyleft (including hosted-service terms), a commercial license is
+available from the author: contact `patraanjan23@users.noreply.github.com`.
+
+The software is provided without warranty and without any liability on the
+author's part, as stated in `LICENSE` §15 and §16.
