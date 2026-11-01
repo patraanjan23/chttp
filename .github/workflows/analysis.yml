@@ -178,6 +178,7 @@ jobs:
           #include <stdio.h>
           #include <string.h>
           #include <sys/socket.h>
+          #include <sys/time.h>
           #include <unistd.h>
 
           static void try_bind(int cloexec, int loopback, int port) {
@@ -212,12 +213,70 @@ jobs:
               close(s);
           }
 
+          /* Which other SOL_SOCKET options fail? For the upstream report. */
+          static void try_option(int optname, const char *label, int port) {
+              int s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+              if (s < 0) {
+                  printf("bindprobe: %s: socket: %s\n", label,
+                         strerror(errno));
+                  return;
+              }
+              if (optname == SO_RCVTIMEO) {
+                  struct timeval tv = {2, 0};
+                  int rc = setsockopt(s, SOL_SOCKET, optname, &tv,
+                                      sizeof tv);
+                  printf("bindprobe: %s: %s\n", label,
+                         rc == 0 ? "ok" : strerror(errno));
+              } else {
+                  int one = 1;
+                  int rc = setsockopt(s, SOL_SOCKET, optname, &one,
+                                      sizeof one);
+                  printf("bindprobe: %s: %s\n", label,
+                         rc == 0 ? "ok" : strerror(errno));
+              }
+              close(s);
+          }
+
+          /* Does bind survive without SO_REUSEADDR? */
+          static void try_bind_without_reuse(int loopback, int port) {
+              int s = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC,
+                             IPPROTO_TCP);
+              if (s < 0) {
+                  printf("bindprobe: (no-reuse loopback=%d) socket: %s\n",
+                         loopback, strerror(errno));
+                  return;
+              }
+              struct sockaddr_in sa;
+              memset(&sa, 0, sizeof sa);
+              sa.sin_family = AF_INET;
+              sa.sin_port = htons((unsigned short)port);
+              sa.sin_addr.s_addr = htonl(loopback ? 0x7f000001 : INADDR_ANY);
+              if (bind(s, (struct sockaddr *)&sa, sizeof sa) < 0) {
+                  printf("bindprobe: (no-reuse loopback=%d) bind: %s\n",
+                         loopback, strerror(errno));
+                  close(s);
+                  return;
+              }
+              if (listen(s, 128) < 0) {
+                  printf("bindprobe: (no-reuse loopback=%d) listen: %s\n",
+                         loopback, strerror(errno));
+              } else {
+                  printf("bindprobe: (no-reuse loopback=%d) bind+listen ok\n",
+                         loopback);
+              }
+              close(s);
+          }
+
           int main(void) {
               int port = 24311;
               try_bind(0, 1, port);
               try_bind(1, 1, port + 1);
               try_bind(0, 0, port + 2);
               try_bind(1, 0, port + 3);
+              try_option(SO_KEEPALIVE, "SO_KEEPALIVE", port);
+              try_option(SO_RCVTIMEO, "SO_RCVTIMEO", port);
+              try_bind_without_reuse(1, port + 5);
+              try_bind_without_reuse(0, port + 6);
               struct addrinfo hints, *results = NULL;
               memset(&hints, 0, sizeof hints);
               hints.ai_family = AF_UNSPEC;
