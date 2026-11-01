@@ -6,9 +6,11 @@ TLS handshake and its crypto in the same tree, so HTTPS adds no library or
 package. The only unusual thing is the compiler: Fil-C checks every pointer
 access, so the code is memory-safe at run time.
 
-It is production-ready at this feature level: bounded concurrency, hard
-per-request deadlines, strict parsing, access logs, backpressure, a graceful
-drain on `SIGTERM`, and an opt-in TLS 1.3 profile.
+**Status: experimental software.** The design is production-ready in principle —
+bounded concurrency, hard per-request deadlines, strict parsing, access logs,
+backpressure, graceful drain on `SIGTERM`, and an opt-in TLS 1.3 profile. This
+code is not distributed as production software; treat it as experimental and
+expect the interfaces and feature surface to change.
 
 ```
 src/main.c            listener, HTTP parsing, routing
