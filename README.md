@@ -652,8 +652,8 @@ to offer your source to those users.
 
 If you want to use chttp in a closed-source product, or under terms that do not
 require copyleft (including hosted-service terms), a commercial license is
-available from the author: contact **[dipanjanpatra](https://github.com/patraanjan23)**
-via a GitHub issue or discussion on this repository, tagged `commercial`.
+available from the author: open a GitHub issue on this repository tagged
+`commercial` and describe your use case.
 
 ### Contributions
 

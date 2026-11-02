@@ -27,9 +27,8 @@ signing step for now; a CLA bot may enforce this formally later.
 
 If you want to build a closed-source product or hosted service on chttp and
 not release your source, you need a commercial license from the copyright
-holder: contact **[Dipanjan Patra](https://github.com/patraanjan23)** via a
-GitHub issue or discussion on this repository, tagged `commercial`. Describe
-your use case and scale, and terms will be quoted.
+holder: open a GitHub issue on this repository tagged `commercial` and
+describe your use case and scale, and terms will be quoted.
 
 Anything else — questions, design objections, security reports — reaches the
 author through the same channels. Please report vulnerabilities privately
