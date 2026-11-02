@@ -313,7 +313,7 @@ jobs:
           cosmo_url="https://github.com/jart/cosmopolitan/releases/download/4.0.2/cosmocc-4.0.2.zip"
           curl -fsSL --retry 3 -o "$cosmo/cosmocc.zip" "$cosmo_url"
           unzip -q "$cosmo/cosmocc.zip" -d "$cosmo/toolchain"
-          "$cosmo/toolchain"/cosmocc/bin/cosmocc -O1 -o build/bindprobe_cosmo \
+          "$cosmo/toolchain"/bin/cosmocc -O1 -o build/bindprobe_cosmo \
             /tmp/bindprobe.c
           file build/bindprobe_cosmo
 
