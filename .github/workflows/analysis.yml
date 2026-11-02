@@ -71,7 +71,7 @@ jobs:
             arch: aarch64
             name: "Ubuntu 26.04 ARM64"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install analysis tools
         run: |
@@ -133,7 +133,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Build host deps
         run: |
@@ -173,7 +173,7 @@ jobs:
         run: make check CC="$RUNNER_TEMP/perefil"/*linux-*/build/bin/filcc
 
       - name: Upload portable binaries
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: portable-binaries
           path: |
