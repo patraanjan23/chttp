@@ -9,15 +9,19 @@
 #     the only hosts where filcc itself, the clang static analyzer
 #     (`make analyze`), strace, and Valgrind can run.
 #
-#   Peregrine Fil-C cross-compilation targets (build + smoke test)
-#     - Linux/x86_64 and Linux/ARM64, Darwin/ARM64 (macOS), Windows/x86_64:
-#       perefil-<ver>-linux-x86_64 builds fat APEs -- one file that runs on
-#       Linux, macOS, and the BSDs (both x86_64 and ARM64) and on
-#       Windows/x86_64. The portable build + full `make check` runs on a
-#       Linux/x86_64 host (the only host Peregrine supports), then the
-#       binary is smoke-tested on macOS/ARM64 and Windows/x86_64 runners.
-#     Peregrine is experimental per the Fil-C release notes; this job's
-#     failures are useful signal.
+#   Peregrine Fil-C cross-compilation target (build + test)
+#     - Linux/x86_64: perefil-<ver>-linux-x86_64 builds fat APEs -- one file
+#       that runs on Linux, macOS, and the BSDs (both x86_64 and ARM64) and
+#       on Windows/x86_64. The portable build + full `make check` runs on a
+#       Linux/x86_64 host (the only host Peregrine supports). The check
+#       exercises the same suites as the native jobs against the portable
+#       binary on the host Peregrine officially supports.
+#     - macOS/Windows smoke testing is temporarily removed: every
+#       SOL_SOCKET setsockopt() returns EINVAL on those APE targets, an
+#       upstream Fil-C runtime gap reported as pizlonator/fil-c#354
+#       (with the probe output and the cosmocc control experiment). The
+#       non-gating smoke jobs ran their course; they can return, strictly
+#       gating, once upstream fixes the runtime.
 #
 # Runs every 6 hours and on demand via the Actions UI.
 
@@ -121,8 +125,8 @@ jobs:
   # ---------------------------------------------------------------------
   # Peregrine Fil-C: portable cross-build (host must be Linux/x86_64).
   # Produces fat APEs that run on Linux, macOS, and the BSDs (both CPU
-  # architectures) and on Windows/x86_64. Full `make check` runs here, then
-  # the APE binaries are uploaded for the smoke jobs below.
+  # architectures) and on Windows/x86_64. Full `make check` runs here on
+  # the Linux/x86_64 host Peregrine officially supports.
   # ---------------------------------------------------------------------
   portable-build:
     name: "Peregrine portable build + check (Linux x86_64)"
@@ -163,160 +167,6 @@ jobs:
           # build/chttp.aarch64.elf (ARM64 ELF) side files for debugging.
           file build/chttp
 
-      - name: Build POSIX bind probe
-        # Diagnostic only, not part of the check suite: reproduces the
-        # exact socket/setsockopt/bind sequence bind_listener() uses, in
-        # its CLOEXEC/plain and loopback/wildcard variants, plus what
-        # getaddrinfo returns for "127.0.0.1" on each target host. Run by
-        # the smoke jobs to attribute their bind failures.
-        run: |
-          set -euo pipefail
-          cat > /tmp/bindprobe.c <<'EOF'
-          #include <arpa/inet.h>
-          #include <errno.h>
-          #include <netdb.h>
-          #include <stdio.h>
-          #include <string.h>
-          #include <sys/socket.h>
-          #include <sys/time.h>
-          #include <unistd.h>
-
-          static void try_bind(int cloexec, int loopback, int port) {
-              int s = socket(AF_INET, SOCK_STREAM | (cloexec ? SOCK_CLOEXEC : 0),
-                             IPPROTO_TCP);
-              if (s < 0) {
-                  printf("bindprobe: (cloexec=%d loopback=%d) socket: %s\n",
-                         cloexec, loopback, strerror(errno));
-                  return;
-              }
-              int reuse = 1;
-              if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &reuse,
-                             sizeof reuse) < 0) {
-                  printf("bindprobe: (cloexec=%d loopback=%d) setsockopt: %s\n",
-                         cloexec, loopback, strerror(errno));
-                  close(s);
-                  return;
-              }
-              struct sockaddr_in sa;
-              memset(&sa, 0, sizeof sa);
-              sa.sin_family = AF_INET;
-              sa.sin_port = htons((unsigned short)port);
-              sa.sin_addr.s_addr = htonl(loopback ? 0x7f000001 : INADDR_ANY);
-              if (bind(s, (struct sockaddr *)&sa, sizeof sa) < 0) {
-                  printf("bindprobe: (cloexec=%d loopback=%d) bind: %s\n",
-                         cloexec, loopback, strerror(errno));
-                  close(s);
-                  return;
-              }
-              printf("bindprobe: (cloexec=%d loopback=%d) ok\n",
-                     cloexec, loopback);
-              close(s);
-          }
-
-          /* Which other SOL_SOCKET options fail? For the upstream report. */
-          static void try_option(int optname, const char *label, int port) {
-              int s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-              if (s < 0) {
-                  printf("bindprobe: %s: socket: %s\n", label,
-                         strerror(errno));
-                  return;
-              }
-              if (optname == SO_RCVTIMEO) {
-                  struct timeval tv = {2, 0};
-                  int rc = setsockopt(s, SOL_SOCKET, optname, &tv,
-                                      sizeof tv);
-                  printf("bindprobe: %s: %s\n", label,
-                         rc == 0 ? "ok" : strerror(errno));
-              } else {
-                  int one = 1;
-                  int rc = setsockopt(s, SOL_SOCKET, optname, &one,
-                                      sizeof one);
-                  printf("bindprobe: %s: %s\n", label,
-                         rc == 0 ? "ok" : strerror(errno));
-              }
-              close(s);
-          }
-
-          /* Does bind survive without SO_REUSEADDR? */
-          static void try_bind_without_reuse(int loopback, int port) {
-              int s = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC,
-                             IPPROTO_TCP);
-              if (s < 0) {
-                  printf("bindprobe: (no-reuse loopback=%d) socket: %s\n",
-                         loopback, strerror(errno));
-                  return;
-              }
-              struct sockaddr_in sa;
-              memset(&sa, 0, sizeof sa);
-              sa.sin_family = AF_INET;
-              sa.sin_port = htons((unsigned short)port);
-              sa.sin_addr.s_addr = htonl(loopback ? 0x7f000001 : INADDR_ANY);
-              if (bind(s, (struct sockaddr *)&sa, sizeof sa) < 0) {
-                  printf("bindprobe: (no-reuse loopback=%d) bind: %s\n",
-                         loopback, strerror(errno));
-                  close(s);
-                  return;
-              }
-              if (listen(s, 128) < 0) {
-                  printf("bindprobe: (no-reuse loopback=%d) listen: %s\n",
-                         loopback, strerror(errno));
-              } else {
-                  printf("bindprobe: (no-reuse loopback=%d) bind+listen ok\n",
-                         loopback);
-              }
-              close(s);
-          }
-
-          int main(void) {
-              int port = 24311;
-              try_bind(0, 1, port);
-              try_bind(1, 1, port + 1);
-              try_bind(0, 0, port + 2);
-              try_bind(1, 0, port + 3);
-              try_option(SO_KEEPALIVE, "SO_KEEPALIVE", port);
-              try_option(SO_RCVTIMEO, "SO_RCVTIMEO", port);
-              try_bind_without_reuse(1, port + 5);
-              try_bind_without_reuse(0, port + 6);
-              struct addrinfo hints, *results = NULL;
-              memset(&hints, 0, sizeof hints);
-              hints.ai_family = AF_UNSPEC;
-              hints.ai_socktype = SOCK_STREAM;
-              hints.ai_flags = AI_PASSIVE | AI_NUMERICSERV;
-              char port_text[8];
-              snprintf(port_text, sizeof port_text, "%d", port + 4);
-              int gai = getaddrinfo("127.0.0.1", port_text, &hints, &results);
-              if (gai != 0) {
-                  printf("bindprobe: getaddrinfo: %s\n", gai_strerror(gai));
-              } else {
-                  for (struct addrinfo *e = results; e != NULL; e = e->ai_next)
-                      printf("bindprobe: getaddrinfo entry: family=%d "
-                             "socktype=%d addrlen=%d\n",
-                             (int)e->ai_family, (int)e->ai_socktype,
-                             (int)e->ai_addrlen);
-                  freeaddrinfo(results);
-              }
-              return 0;
-          }
-          EOF
-          # Assignment contexts do not glob-expand: resolve the filcc
-          # path explicitly here (unlike the make CC=... lines, which are
-          # command arguments and expand normally).
-          filcc=$(ls -1 "$RUNNER_TEMP"/perefil/*linux-*/build/bin/filcc | head -n1)
-          "$filcc" -O1 -o build/bindprobe /tmp/bindprobe.c
-          # Control experiment: build the identical probe with plain
-          # Cosmopolitan (no Fil-C layer). If this binds where the Fil-C
-          # probe fails, the defect sits in Fil-C's syscall layer; if it
-          # fails identically the behavior was inherited from cosmo. The
-          # discriminant goes into the upstream report.
-          cosmo="$RUNNER_TEMP/cosmo"
-          mkdir -p "$cosmo"
-          cosmo_url="https://github.com/jart/cosmopolitan/releases/download/4.0.2/cosmocc-4.0.2.zip"
-          curl -fsSL --retry 3 -o "$cosmo/cosmocc.zip" "$cosmo_url"
-          unzip -q "$cosmo/cosmocc.zip" -d "$cosmo/toolchain"
-          "$cosmo/toolchain"/bin/cosmocc -O1 -o build/bindprobe_cosmo \
-            /tmp/bindprobe.c
-          file build/bindprobe_cosmo
-
       - name: Test suites (crypto, HTTP smoke, TLS)
         # Same suites the native jobs run, against the portable binary.
         # Rebuild is skipped: build/chttp is already up to date.
@@ -329,87 +179,6 @@ jobs:
           path: |
             build/chttp
             build/crypto_test
-            build/bindprobe
-            build/bindprobe_cosmo
           retention-days: 7
 
   # ---------------------------------------------------------------------
-  # Peregrine targets: smoke tests on the platforms the fat APE supports.
-  # Full suites stay on the Linux build host; here we exercise the crypto
-  # known-answer vectors and the core HTTP surface of the same binary.
-  # The .com suffix is required for Windows to recognise the APE as a PE.
-  # ---------------------------------------------------------------------
-  portable-smoke:
-    name: ${{ matrix.name }}
-    needs: portable-build
-    # Not gating, on purpose and unlike the TLS suite fix: the probe proves
-    # the APE runs and the crypto vectors pass on Darwin/ARM64 and
-    # Windows/x86_64. The blocker is an upstream Fil-C runtime gap: every
-    # SOL_SOCKET setsockopt returns EINVAL on those APE targets (probe
-    # output in the logs; bind() and listen() work without the options).
-    # Working around it inside the trusted core would degrade every
-    # platform's behavior for the sake of a kernel-specific compatibility
-    # layer the project does not own.
-    continue-on-error: true
-    runs-on: ${{ matrix.runs-on }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runs-on: macos-latest
-            name: "Peregrine smoke on macOS (experimental; Fil-C runtime setsockopt gap)"
-          - runs-on: windows-latest
-            name: "Peregrine smoke on Windows (experimental; Fil-C runtime setsockopt gap)"
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: portable-binaries
-
-      - name: Bind probe (diagnostic)
-        shell: bash
-        run: |
-          # Always informative; output classifies the bind failure shape.
-          cp bindprobe bindprobe.com
-          cp bindprobe_cosmo bindprobe_cosmo.com
-          chmod +x bindprobe.com bindprobe_cosmo.com
-          echo "=== Fil-C (perefil) probe ==="
-          ./bindprobe.com
-          echo "=== plain Cosmopolitan (cosmocc) probe ==="
-          ./bindprobe_cosmo.com
-
-      - name: Smoke test (crypto + HTTP)
-        shell: bash
-        run: |
-          set -e
-          # .com suffix is required for Windows to exec the APE as a PE.
-          cp chttp chttp.com
-          cp crypto_test crypto_test.com
-          chmod +x chttp.com crypto_test.com
-          ./crypto_test.com
-          port=$((20000 + $RANDOM % 20000))
-          ./chttp.com --port "$port" --timeout 3 --max-connections 4 \
-            >server.log 2>&1 &
-          pid=$!
-          trap 'kill $pid 2>/dev/null || true' EXIT
-          up=0
-          for i in $(seq 1 50); do
-            curl -fsS --max-time 1 "http://127.0.0.1:$port/health" \
-              >/dev/null 2>&1 && { up=1; break; }
-            sleep 0.3
-          done
-          if [ "$up" != 1 ]; then
-            echo "FAIL: portable server did not listen on 127.0.0.1:$port" >&2
-            echo "--- server.log ---" >&2
-            cat server.log >&2 || true
-            exit 1
-          fi
-          curl -fsS --max-time 3 "http://127.0.0.1:$port/" \
-            | grep -q "hello from Fil-C"
-          curl -fsS --max-time 3 --data-binary hello \
-            "http://127.0.0.1:$port/" | grep -qx hello
-          # SIGTERM is the server's graceful drain: the parent forwards it
-          # to the workers, so killing the parent is enough on any OS.
-          kill "$pid" 2>/dev/null || true
-          sleep 1
-          echo "ok: portable APE serves HTTP ($RUNNER_OS, $RUNNER_ARCH)"
