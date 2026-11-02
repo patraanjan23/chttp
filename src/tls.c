@@ -1,4 +1,17 @@
 /*
+ * This file is part of chttp.
+ * Copyright (c) 2026 Dipanjan Patra <patraanjan23@users.noreply.github.com>.
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only
+ *
+ * chttp is free software: you may redistribute and/or modify it under the
+ * terms of the GNU Affero General Public License, version 3, as published by
+ * the Free Software Foundation. Offering this software, or anything built on
+ * it, as a hosted or closed-source product without releasing your source
+ * requires a commercial license from the author (see README, License).
+ */
+
+/*
  * chttp TLS 1.3 - see tls.h.
  *
  * The record layer and handshake state machine are written here; the

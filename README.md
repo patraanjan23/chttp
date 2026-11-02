@@ -654,5 +654,14 @@ If you want to use chttp in a closed-source product, or under terms that do not
 require copyleft (including hosted-service terms), a commercial license is
 available from the author: contact `patraanjan23@users.noreply.github.com`.
 
+### Contributions
+
+Copyright stays with the author so that commercial licenses can be granted.
+By submitting a patch, issue fix, or pull request you agree that it is
+licensed under **both** of the above: the GNU Affero GPL v3.0 (perpetually,
+irrevocably), and the commercial license the author grants — so your
+contribution may be freely incorporated into either offering without further
+permission.
+
 The software is provided without warranty and without any liability on the
 author's part, as stated in `LICENSE` §15 and §16.
