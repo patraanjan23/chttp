@@ -26,4 +26,4 @@ Details: [CONTRIBUTING.md](../blob/main/CONTRIBUTING.md#licensing-of-your-contri
 - [ ] `make` builds clean, `make test` passes
 - [ ] No dynamic allocation outside bounded startup; every wait has a deadline
 - [ ] Every read is length-checked before use
-- [ ] Security-sensitive changes discussed privately first (patraanjan23@users.noreply.github.com)
+- [ ] Security-sensitive changes discussed privately first — GitHub private vulnerability reporting (Security tab)
