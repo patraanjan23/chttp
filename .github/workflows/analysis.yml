@@ -310,7 +310,7 @@ jobs:
           # discriminant goes into the upstream report.
           cosmo="$RUNNER_TEMP/cosmo"
           mkdir -p "$cosmo"
-          cosmo_url="https://github.com/jart/cosmopolitan/releases/download/v4.0.2/cosmocc-4.0.2.zip"
+          cosmo_url="https://github.com/jart/cosmopolitan/releases/download/4.0.2/cosmocc-4.0.2.zip"
           curl -fsSL --retry 3 -o "$cosmo/cosmocc.zip" "$cosmo_url"
           unzip -q "$cosmo/cosmocc.zip" -d "$cosmo/toolchain"
           "$cosmo/toolchain"/cosmocc/bin/cosmocc -O1 -o build/bindprobe_cosmo \
