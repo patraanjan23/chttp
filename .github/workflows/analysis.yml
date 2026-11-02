@@ -303,7 +303,19 @@ jobs:
           # command arguments and expand normally).
           filcc=$(ls -1 "$RUNNER_TEMP"/perefil/*linux-*/build/bin/filcc | head -n1)
           "$filcc" -O1 -o build/bindprobe /tmp/bindprobe.c
-          file build/bindprobe
+          # Control experiment: build the identical probe with plain
+          # Cosmopolitan (no Fil-C layer). If this binds where the Fil-C
+          # probe fails, the defect sits in Fil-C's syscall layer; if it
+          # fails identically the behavior was inherited from cosmo. The
+          # discriminant goes into the upstream report.
+          cosmo="$RUNNER_TEMP/cosmo"
+          mkdir -p "$cosmo"
+          cosmo_url="https://github.com/jart/cosmopolitan/releases/download/v4.0.2/cosmocc-4.0.2.zip"
+          curl -fsSL --retry 3 -o "$cosmo/cosmocc.zip" "$cosmo_url"
+          unzip -q "$cosmo/cosmocc.zip" -d "$cosmo/toolchain"
+          "$cosmo/toolchain"/cosmocc/bin/cosmocc -O1 -o build/bindprobe_cosmo \
+            /tmp/bindprobe.c
+          file build/bindprobe_cosmo
 
       - name: Test suites (crypto, HTTP smoke, TLS)
         # Same suites the native jobs run, against the portable binary.
@@ -318,6 +330,7 @@ jobs:
             build/chttp
             build/crypto_test
             build/bindprobe
+            build/bindprobe_cosmo
           retention-days: 7
 
   # ---------------------------------------------------------------------
@@ -358,8 +371,12 @@ jobs:
         run: |
           # Always informative; output classifies the bind failure shape.
           cp bindprobe bindprobe.com
-          chmod +x bindprobe.com
+          cp bindprobe_cosmo bindprobe_cosmo.com
+          chmod +x bindprobe.com bindprobe_cosmo.com
+          echo "=== Fil-C (perefil) probe ==="
           ./bindprobe.com
+          echo "=== plain Cosmopolitan (cosmocc) probe ==="
+          ./bindprobe_cosmo.com
 
       - name: Smoke test (crypto + HTTP)
         shell: bash
